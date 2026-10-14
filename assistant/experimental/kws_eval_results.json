@@ -1,0 +1,44 @@
+[
+  {
+    "keywords_score": 1.0,
+    "keywords_threshold": 0.25,
+    "pos_hits": 14,
+    "pos_total": 124,
+    "detection_rate": 0.1129,
+    "neg_false_events": 0,
+    "neg_windows_with_false": 0,
+    "neg_windows_total": 50,
+    "neg_audio_minutes": 2.24,
+    "false_events_per_minute": 0.0,
+    "rtf_cpu": 0.0455,
+    "avg_processing_ms_per_audio_sec": 45.55
+  },
+  {
+    "keywords_score": 2.0,
+    "keywords_threshold": 0.25,
+    "pos_hits": 9,
+    "pos_total": 124,
+    "detection_rate": 0.0726,
+    "neg_false_events": 0,
+    "neg_windows_with_false": 0,
+    "neg_windows_total": 50,
+    "neg_audio_minutes": 2.24,
+    "false_events_per_minute": 0.0,
+    "rtf_cpu": 0.0441,
+    "avg_processing_ms_per_audio_sec": 44.12
+  },
+  {
+    "keywords_score": 2.0,
+    "keywords_threshold": 0.35,
+    "pos_hits": 3,
+    "pos_total": 124,
+    "detection_rate": 0.0242,
+    "neg_false_events": 0,
+    "neg_windows_with_false": 0,
+    "neg_windows_total": 50,
+    "neg_audio_minutes": 2.24,
+    "false_events_per_minute": 0.0,
+    "rtf_cpu": 0.0435,
+    "avg_processing_ms_per_audio_sec": 43.54
+  }
+]

@@ -1,0 +1,257 @@
+# Memoir assistant configuration.
+# Every threshold and feature flag lives here so tuning never requires a code change.
+
+[spotify]
+# Follow playback on the shared account, including the phone driving the speaker.
+target = "active"
+# After a requested song or artist, send a local radio (same artist, collaborators,
+# shared playlists; built from the track index) in the same start_playback call, so
+# playback continues like Spotify's song radio. "just play X" opts out per request.
+# Spotify allows 100 uris per call; 49 radio tracks + the song. Autoplay takes over after.
+radio_after_song = true
+radio_length     = 49
+# Local catalogue builds can make many Spotify requests. Keep automatic
+# refreshes off; rebuild explicitly with `python -m assistant.catalogue`.
+catalogue_auto_refresh = false
+
+[runtime]
+# Prevent automatic system sleep while Memoir listens on confirmed AC power.
+# Battery and unknown power states never hold a request. Manual sleep still wins;
+# display sleep remains allowed. Disable to opt out completely.
+keep_awake_on_ac = true
+
+[audio]
+# NEVER "default": Windows can silently route input from the Bluetooth speaker's
+# headset profile, which collapses quality to 8 kHz. Pin the internal mic by name.
+# Run `python -m assistant.audio --list` to see available devices.
+input_device        = "Microphone Array (Realtek(R) Audio)"
+# While Spotify is paused, listen on this Bluetooth headset mic as well as the
+# laptop mic. Close it before playback so SoundDrum stays in stereo mode.
+# Off: opening the SoundDrum's own mic while paused forces the speaker into
+# Bluetooth hands-free mode, which must switch back before a song can start
+# (slow first seconds, lower quality) and produced false triggers. The laptop
+# mic hears the user fine when nothing is playing.
+paused_input_device = ""
+paused_capture_rate = 16000
+sample_rate         = 16000   # what the models consume; never change
+# Capture at the device's native rate and downsample. WASAPI will not open at
+# an arbitrary rate, and exclusive mode never will.
+capture_rate        = 48000
+# Exclusive mode bypasses the Windows shared-mode effects chain, at the cost of
+# LOCKING the microphone -- no other app (Wispr Flow, Teams) can use it. It was
+# needed while "audio enhancements" were enabled on this mic: that chain both
+# zeroed shared-mode capture and attenuated everything by roughly 30 dB. With
+# enhancements turned off, shared mode delivers full-level audio, so this stays
+# false. If capture ever goes silent again, check that setting first.
+exclusive_mode      = false
+# Subtract what the speaker is playing (WASAPI loopback) from the mic, using
+# WebRTC AEC3. Used only to decide when the USER is speaking -- music vocals
+# used to count as speech -- never fed to Whisper, which it degrades.
+echo_cancellation   = true
+echo_reference      = "Headphones (SoundDrum P)"
+frame_length        = 512     # Silero VAD requires exactly this; wake.py buffers to 1280
+ring_buffer_seconds = 30      # for miss-logging and wake-word pre-roll
+
+[wake]
+# openWakeWord (Apache-2.0, keyless, fully offline). Porcupine was dropped because
+# Picovoice discontinued its free tier and free AccessKeys stop working after
+# 2026-06-30, with no personal/non-commercial plan.
+#
+# Pretrained: alexa, hey_mycroft, hey_jarvis, hey_rhasspy.
+# Benchmarked against this user's voice on CLEAN audio (scripts/wake_bench.py):
+#   hey_mycroft 1.000 | alexa 0.978 | hey_jarvis 0.261 | hey_rhasspy 0.006
+# hey_mycroft scored highest in the bench but fired only ~5/10 in real use, so
+# alexa is in play instead. Caveat: alexa WILL collide with an Amazon Echo in
+# earshot -- switch to hey_mycroft if that ever becomes a problem.
+#
+# An earlier benchmark scored every model near zero and led to a wrong
+# conclusion that no model matched this voice. That run was fed audio corrupted
+# by a capture bug (see [audio].blocksize note). Re-benchmark on known-good
+# audio before drawing conclusions about a model.
+# Or a path to a custom .onnx -- see README for training "hey memoir".
+# A list runs every model at once and triggers on whichever scores highest.
+# Single-model hit rate was only ~2 in 5; the models miss different utterances,
+# so two together cover noticeably more. Say either phrase.
+model           = ["alexa", "hey_mycroft"]
+# Real 0-1 confidence, so the tiers are native rather than emulated.
+# In STT-listener mode only the high tier ducks early. A stronger score at or
+# above acoustic_activation_threshold can start the spoken acknowledgement
+# and separate command capture after text confirmation.
+threshold_low   = 0.15
+threshold_high  = 0.60   # high confidence (can pause instead of duck)
+# Above this stronger score, acknowledge Alexa immediately in STT mode too.
+# Exact prefix text triggers remain active without acoustic evidence. Aliases
+# and mid-utterance triggers need a matching high acoustic hit or an exact
+# final command-model verification.
+acoustic_activation_threshold = 0.75
+cooldown_seconds = 2.0
+# Personal "Alexa" model trained on this user's voice (assistant/experimental/
+# wake_train). Held-out: 95% of enrollment clips and 16/19 in the over-music
+# recording vs 21% and 8/19 for stock, but ~36 false activations/hour on
+# generic speech at 0.5 x2 -- so it only proposes a wake: small.en must hear
+# "Alexa" in the last 1.6 s before anything happens.
+personal_model     = "assistant/models/wake/alexa_user.onnx"
+personal_threshold = 0.5
+personal_patience  = 2      # consecutive 80 ms chunks at or above threshold
+
+[listener]
+# A fast trigger-specific recognizer remains a fallback for acoustic misses;
+# strong acoustic Alexa detections can also start the follow-up capture.
+mode            = "stt"
+# Opt in to the single-owner asynchronous capture path.
+async_enabled   = false
+# Keep acoustic and text trigger vocabularies aligned. Common words such as
+# "computer" made ordinary dictation look like a command.
+phrases         = ["alexa", "hey mycroft"]
+allow_fuzzy     = false
+fuzzy_cutoff    = 0.72
+# 300 discarded quiet/far "Alexa"s before transcription (00:00, 9 in 30 s).
+min_speech_ms   = 160     # ignore clicks; a soft "Alexa" can be ~6 voiced frames
+vad_threshold   = 0.2     # wake gate only; capture keeps [capture].vad_threshold
+max_utterance_s = 6.0     # force a transcription even if speech never stops
+pad_ms          = 300     # audio kept from BEFORE speech starts
+# Small.en performs the continuous text wake checks; large-v3-turbo verifies
+# ambiguous final wakes and transcribes commands.
+# Local snapshot on A: -- the default cache lives on C:, which gets cleared.
+stt_model       = "faster-whisper/A:/hf-cache/ct2/models--Systran--faster-whisper-small.en/snapshots/d1d751a5f8271d482d14ca55d9e2deeebbae577f"
+silence_ms      = 350     # bare wake endpoint; verify one-breath command gaps live
+peek_first_ms   = 700     # "Alexa" is ~0.6 s; first check right after it
+peek_every_ms   = 500     # 1000 ducked ~1.3 s after "Alexa" over music
+peek_until_ms   = 10000
+peek_window_ms  = 1600    # bounded recent audio while vocal music keeps VAD open
+# Over vocal music the VAD never hears silence, so speech is cut into
+# max_utterance_s chunks. Chunks overlap so a wake word is never split, a wake
+# word may follow lyrics, and a command cut mid-sentence waits for its end.
+overlap_ms      = 1500
+extend_ms       = 14000   # confirmed one-breath requests may continue to 20 s
+mid_phrases     = ["alexa"]
+# Full ignored transcripts are disabled; rejected wake diagnostics record
+# counts and reason without ambient speech text.
+log_ignored     = false
+
+[listener.aliases]
+# These Alexa mishearings require acoustic corroboration or exact final
+# command-model verification; the alias alone cannot authorize a request.
+lexa      = "alexa"
+alexis    = "alexa"
+# Seen live: "Elixir?" at the same moment the acoustic model scored 0.70.
+elixir    = "alexa"
+elixa     = "alexa"
+elexa     = "alexa"
+alexei    = "alexa"
+alexia    = "alexa"
+
+[capture]
+silence_ms          = 800    # end of speech after this much silence
+max_seconds         = 23.5   # start window + full command budget, not a six-second cut
+utterance_seconds   = 20.0   # silence still ends short commands promptly
+# Time allowed for you to START speaking after the wake beep. 1500 ms was far
+# too tight: you wait to hear the beep, then react, and that alone can eat it --
+# every command aborted as a false accept before a word was said.
+speech_timeout_ms   = 3500
+# Wait after a spoken prompt before recording. Bluetooth keeps playing for a
+# few hundred ms after playback "finishes"; 120 ms recorded our own voice.
+playback_settle_ms  = 350
+preroll_seconds     = 1.5    # archived BEFORE the trigger; required for wake-word training
+# Silero speech probability needed to count as speech. Lowered from 0.5: this
+# room carries a lot of low-frequency noise (~33% of signal below 300 Hz), which
+# drags the ratio down on quieter word onsets.
+vad_threshold       = 0.35
+
+[ducking]
+# Temporarily duck Spotify's Windows mixer session TO this percent, not BY it.
+# The Spotify Connect slider and Windows master level are not changed by ducking.
+# Explicit volume commands separately control Windows master volume.
+duck_to_percent = 10
+# What decides when to duck, in stt mode:
+#   "wakeword" - only the high acoustic tier ducks early; the low tier does
+#                not duck. Validated text wake checks can also duck while the
+#                utterance continues. Acting still requires wake confirmation.
+#   "speech"   - duck on any detected speech (ducks on vocal music: avoid)
+#   "none"     - never duck early; commands over loud music will suffer
+duck_trigger    = "wakeword"
+# If true, a high-confidence wake (both tiers fired) pauses instead of ducking.
+# Off by default: a false accept that pauses your music is worse than one that ducks it.
+pause_on_high_confidence = false
+
+[intent]
+# "brain": plain transport ("pause", "next", "volume 40") is answered by the
+# rules instantly; everything else goes to a local LLM (Ollama) that picks one
+# tool, with the user's artists/playlists as context, validated in code.
+# Ollama warms in the background. Startup loading can exceed the command
+# timeout; unavailable or slow inference leaves rule parsing in place.
+# Historical benchmark scores are not current live accuracy guarantees.
+backend = "brain"
+model = "qwen3:4b-instruct-2507-q4_K_M"
+timeout_seconds = 3.0
+
+[conversation]
+# Incremental central interpreter integration. Keep disabled until the
+# real-model routing gate is accepted.
+enabled = false
+timeout_seconds = 3.0
+
+[stt]
+# Runs locally on the RTX 4060. large-v3-turbo without global hints recovered
+# the real "pause" clip that small.en and hinted turbo both heard as "Buzz".
+# Large-v3-turbo is the command recognizer; small.en is configured separately
+# under [listener] for continuous wake checks.
+model = "faster-whisper/A:/pisha/memoir/assistant/models/hf-cache/models--mobiuslabsgmbh--faster-whisper-large-v3-turbo/snapshots/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
+# Broad hints caused the real pause clip to regress to "Buzz" and can force one
+# known artist over another. Entity resolution operates after unbiased STT.
+bias_from_spotify = false
+
+[feedback]
+beeps_enabled = true
+# Off by the user's choice: no "Yes sir?" to wait for. On a bare "Alexa" the
+# music ducks, a 45 ms tick plays without blocking, and capture continues
+# with nothing flushed -- a command said straight after "Alexa" is kept.
+# (With the spoken prompt, a command said during it was flushed and lost.)
+speak_on_wake = false
+# Short on purpose: the longer "Yes sir, go ahead." added wait before every
+# command and its tail was being recorded as the command ("Okay.", "Good.").
+wake_phrase   = "Yes sir?"
+# Route speech explicitly through SoundDrum using its configured MME output.
+output_device = "Headphones (SoundDrum P), MME"
+# Speech on failure/ambiguity only. Confirming every success out loud becomes
+# noise within days; the music itself is the confirmation.
+speak_on_failure = true
+speak_on_success = false
+# Optional ceiling on prompt loudness, as a Windows master-volume equivalent.
+# Attenuate prompt PCM at high output levels; never raise master volume.
+max_output_level = 0.35
+piper_voice = "assistant/models/en_US-lessac-medium.onnx"
+
+[hotkey]
+enabled = true
+combo   = "<ctrl>+<alt>+<space>"
+# Dumps the last N seconds of the ring buffer as a labelled missed detection.
+miss_combo = "<ctrl>+<alt>+m"
+
+[codex]
+# General capabilities are separate from the Spotify brain. The connection
+# starts lazily and accepts ChatGPT sign-in only, never a separately billed key.
+enabled = true
+model = "gpt-6-luna"
+job_timeout_seconds = 900
+dictation_timeout_seconds = 90
+max_prompt_chars = 12000
+segment_seconds = 20.0
+segment_start_timeout_ms = 15000
+dictation_silence_ms = 1000
+confirmation_silence_ms = 600
+
+[telemetry]
+jsonl_path       = "assistant/logs/telemetry.jsonl"
+text_log_path    = "assistant/logs/memoir.log"
+audio_dir        = "assistant/logs/audio"
+archive_audio    = true
+max_audio_mb     = 2048
+# Wake-like utterances that were refused ("Alexei", turbo disagreements) are kept as
+# clips in audio/near_miss/ for wake-word retraining. They count toward max_audio_mb
+# and are also capped here, so they cannot crowd out the command archive.
+max_near_miss_mb = 256
+wake_candidates_enabled = true
+wake_candidate_vad_threshold = 0.08
+# Machine-health line in memoir.log (memory, commit, GPU, Ollama, Spotify ban ...).
+health_interval_s = 600

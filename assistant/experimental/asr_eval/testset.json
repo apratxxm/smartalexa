@@ -1,0 +1,581 @@
+{
+  "sample_rate": 16000,
+  "command_clips": [
+    {
+      "id": "dc44b90f4d44",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-221100_dc44b90f4d44.wav",
+      "expected_transcript": "play Madira by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 4.896
+    },
+    {
+      "id": "75eaddb9f0da",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-221114_75eaddb9f0da.wav",
+      "expected_transcript": "play Madira by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 2.784
+    },
+    {
+      "id": "7c3c9c5df293",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-221129_7c3c9c5df293.wav",
+      "expected_transcript": "play Madira by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 3.104
+    },
+    {
+      "id": "0aefd88aa39b",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-221959_0aefd88aa39b.wav",
+      "expected_transcript": "play Madira by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 3.072
+    },
+    {
+      "id": "e3638eedb17a",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-231446_e3638eedb17a.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 3.744
+    },
+    {
+      "id": "b2c99bfc4359",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-233520_b2c99bfc4359.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 5.472
+    },
+    {
+      "id": "5f21b8130d3f",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-144108_5f21b8130d3f.wav",
+      "expected_transcript": "play Naksha by Seedhe Maut",
+      "source": "explicit",
+      "duration_s": 2.688
+    },
+    {
+      "id": "cb028d864b08",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-183127_cb028d864b08.wav",
+      "expected_transcript": "play 3 Cheez by The Siege",
+      "source": "explicit",
+      "duration_s": 4.096
+    },
+    {
+      "id": "0e9d6720c158",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-231640_0e9d6720c158.wav",
+      "expected_transcript": "pause",
+      "source": "explicit",
+      "duration_s": 1.088
+    },
+    {
+      "id": "370786df91f6",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-120214_370786df91f6.wav",
+      "expected_transcript": "pause",
+      "source": "explicit",
+      "duration_s": 1.824
+    },
+    {
+      "id": "ef672847ae6d",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-231731_ef672847ae6d.wav",
+      "expected_transcript": "volume 70",
+      "source": "explicit",
+      "duration_s": 4.096
+    },
+    {
+      "id": "65a929b6449a",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-233558_65a929b6449a.wav",
+      "expected_transcript": "volume 15",
+      "source": "explicit",
+      "duration_s": 2.944
+    },
+    {
+      "id": "d0037412d046",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-231654_d0037412d046.wav",
+      "expected_transcript": "play Creep by Radiohead",
+      "source": "explicit",
+      "duration_s": 5.632
+    },
+    {
+      "id": "bd8097106186",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260902-212400_bd8097106186.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 2.688
+    },
+    {
+      "id": "fb2e21df4f94",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-031054_fb2e21df4f94.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 3.072
+    },
+    {
+      "id": "32bec86eea22",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-185432_32bec86eea22.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 2.24
+    },
+    {
+      "id": "2d1b947918ca",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-214806_2d1b947918ca.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 2.528
+    },
+    {
+      "id": "84d1eaf268d8",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-220507_84d1eaf268d8.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 3.104
+    },
+    {
+      "id": "4de8cb47e9fc",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-232018_4de8cb47e9fc.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 3.584
+    },
+    {
+      "id": "2c7980b64c6a",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-165311_2c7980b64c6a.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 4.192
+    },
+    {
+      "id": "4f582eec1cd7",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-185147_4f582eec1cd7.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 4.96
+    },
+    {
+      "id": "c2529385e67c",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-220028_c2529385e67c.wav",
+      "expected_transcript": "play Red by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 5.024
+    },
+    {
+      "id": "25b2da9b3be2",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-172817_25b2da9b3be2.wav",
+      "expected_transcript": "play Naksha by Seedhe Maut",
+      "source": "curated_ok",
+      "duration_s": 3.296
+    },
+    {
+      "id": "7883f097683c",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-230930_7883f097683c.wav",
+      "expected_transcript": "play champagne poetry by Drake",
+      "source": "curated_ok",
+      "duration_s": 3.264
+    },
+    {
+      "id": "0af40fac3656",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-144134_0af40fac3656.wav",
+      "expected_transcript": "play my beyond playlist",
+      "source": "curated_ok",
+      "duration_s": 3.104
+    },
+    {
+      "id": "f7edfb053eb2",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-232537_f7edfb053eb2.wav",
+      "expected_transcript": "play my beyond playlist",
+      "source": "curated_ok",
+      "duration_s": 3.296
+    },
+    {
+      "id": "ee212667ca2f",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-173322_ee212667ca2f.wav",
+      "expected_transcript": "play my dhh playlist",
+      "source": "curated_ok",
+      "duration_s": 3.584
+    },
+    {
+      "id": "a9effb986f20",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-222012_a9effb986f20.wav",
+      "expected_transcript": "play my dhh playlist",
+      "source": "curated_ok",
+      "duration_s": 3.04
+    },
+    {
+      "id": "30ba795de3a8",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260910-124708_30ba795de3a8.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 1.856
+    },
+    {
+      "id": "22136bfc28bc",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-025219_22136bfc28bc.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 3.104
+    },
+    {
+      "id": "1fff418d1bc6",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-030048_1fff418d1bc6.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 1.952
+    },
+    {
+      "id": "0c8bec35fff7",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-030958_0c8bec35fff7.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 1.984
+    },
+    {
+      "id": "bebab762f1e8",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-110442_bebab762f1e8.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 3.168
+    },
+    {
+      "id": "e049fdecf9db",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-111900_e049fdecf9db.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 1.92
+    },
+    {
+      "id": "a9e02925d5b2",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-170243_a9e02925d5b2.wav",
+      "expected_transcript": "pause",
+      "source": "curated_ok",
+      "duration_s": 4.992
+    },
+    {
+      "id": "97968251de05",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-143822_97968251de05.wav",
+      "expected_transcript": "volume 70",
+      "source": "curated_ok",
+      "duration_s": 2.688
+    },
+    {
+      "id": "820b422741cc",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-220519_820b422741cc.wav",
+      "expected_transcript": "volume 65",
+      "source": "curated_ok",
+      "duration_s": 3.232
+    },
+    {
+      "id": "9beaa3cc8497",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-220615_9beaa3cc8497.wav",
+      "expected_transcript": "volume 30",
+      "source": "curated_ok",
+      "duration_s": 3.488
+    },
+    {
+      "id": "82ecf2141346",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-221455_82ecf2141346.wav",
+      "expected_transcript": "volume 60",
+      "source": "curated_ok",
+      "duration_s": 2.56
+    },
+    {
+      "id": "4f8492dfd079",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-232040_4f8492dfd079.wav",
+      "expected_transcript": "volume 50",
+      "source": "curated_ok",
+      "duration_s": 2.56
+    },
+    {
+      "id": "33230781267e",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-232726_33230781267e.wav",
+      "expected_transcript": "volume 60",
+      "source": "curated_ok",
+      "duration_s": 3.2
+    },
+    {
+      "id": "77270782abe7",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260926-222041_77270782abe7.wav",
+      "expected_transcript": "volume 50",
+      "source": "curated_ok",
+      "duration_s": 5.984
+    },
+    {
+      "id": "fe19a21db0c1",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260910-124752_fe19a21db0c1.wav",
+      "expected_transcript": "volume 50",
+      "source": "curated_ok",
+      "duration_s": 2.048
+    },
+    {
+      "id": "de6de573c7c9",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260927-000459_de6de573c7c9.wav",
+      "expected_transcript": "volume 20",
+      "source": "curated_ok",
+      "duration_s": 5.568
+    },
+    {
+      "id": "ad5278b3f08e",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260923-232555_ad5278b3f08e.wav",
+      "expected_transcript": "skip",
+      "source": "curated_ok",
+      "duration_s": 2.592
+    },
+    {
+      "id": "20260910-125041_a0c6071b40d3",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260910-125041_a0c6071b40d3.wav",
+      "expected_transcript": "pause",
+      "source": "real_commands_confirmed",
+      "duration_s": 2.336
+    },
+    {
+      "id": "20260910-125050_977ae623a4ef",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260910-125050_977ae623a4ef.wav",
+      "expected_transcript": "play demons",
+      "source": "real_commands_confirmed",
+      "duration_s": 3.648
+    },
+    {
+      "id": "20260910-125120_8bbb175a73a9",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\audio\\20260910-125120_8bbb175a73a9.wav",
+      "expected_transcript": "play Nakhsha by Seedhe Maut",
+      "source": "real_commands_confirmed",
+      "duration_s": 3.424
+    }
+  ],
+  "negative_clips": [
+    {
+      "id": "20260926-221112_mic16k_0",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 0,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_48000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 48000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_96000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 96000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_144000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 144000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_192000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 192000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_240000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 240000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_288000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 288000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_336000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 336000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_384000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 384000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "20260926-221112_mic16k_432000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\20260926-221112\\mic16k.wav",
+      "offset_samples": 432000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_0",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 0,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_48000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 48000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_96000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 96000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_144000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 144000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_192000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 192000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    },
+    {
+      "id": "live-223244_raw_240000",
+      "audio_path": "A:\\pisha\\memoir\\assistant\\logs\\aec\\live-223244\\raw.wav",
+      "offset_samples": 240000,
+      "num_samples": 48000,
+      "source": "aec_negative"
+    }
+  ],
+  "hotwords_artists": [
+    "Seedhe Maut",
+    "Rawal",
+    "Jack Harlow",
+    "Dhanji",
+    "Naam Sujal",
+    "The Beatles",
+    "The Strokes",
+    "Karma",
+    "Chaar Diwaari",
+    "Bhaskar",
+    "The Siege",
+    "Calm",
+    "Kanye West",
+    "Pritam",
+    "Prateek Kuhad",
+    "Arpit Bala",
+    "Lifafa",
+    "Drake",
+    "Frappe Ash",
+    "wolf.cryman",
+    "21 Savage",
+    "Shashwat Bulusu",
+    "Vishal-Shekhar",
+    "Farak",
+    "Shyko Music",
+    "Red Hot Chili Peppers",
+    "Linkin Park",
+    "Siyaahi",
+    "Smoke",
+    "Joji",
+    "Joyner Lucas",
+    "Taba Chake",
+    "The Smiths",
+    "J. Cole",
+    "Pink Floyd",
+    "A.R. Rahman",
+    "Mac Miller",
+    "Arijit Singh",
+    "System Of A Down",
+    "Nanku",
+    "Metallica",
+    "Peter Cat Recording Co.",
+    "Tame Impala",
+    "Shankar-Ehsaan-Loy",
+    "Kendrick Lamar",
+    "Car Seat Headrest",
+    "Sachin-Jigar",
+    "Bharat Chauhan",
+    "Shashwat Sachdev",
+    "vichaar"
+  ],
+  "hotwords_hints": [
+    "bp",
+    "dil",
+    "beyond",
+    "DHH Gym",
+    "Calm aur Encore",
+    "My Shazam Tracks",
+    "Itna na mujhse tu pyar badha",
+    "94.3 ",
+    "the kill",
+    "Hindi Old Is Gold Hits ",
+    "the climb",
+    "no one",
+    "Midnight Thoughts",
+    "Gym workout Hindi songs",
+    "Ab Toh Aadat si hai Mujhko",
+    "Trending Hindi Rap Songs 2026 ",
+    "Dhh",
+    "Desi Maal",
+    "ro kon raha hai \ud83e\udd28",
+    "My Playlist #2",
+    "sukoon",
+    "samay se pareh",
+    "Seedhe Maut",
+    "Rawal",
+    "Jack Harlow",
+    "Dhanji",
+    "Naam Sujal",
+    "The Beatles",
+    "The Strokes",
+    "Karma",
+    "Chaar Diwaari",
+    "Bhaskar",
+    "The Siege",
+    "Calm",
+    "Kanye West",
+    "Pritam",
+    "Prateek Kuhad",
+    "Arpit Bala",
+    "Lifafa",
+    "Drake",
+    "Frappe Ash",
+    "wolf.cryman",
+    "21 Savage",
+    "Shashwat Bulusu",
+    "Vishal-Shekhar",
+    "Farak",
+    "Shyko Music",
+    "Red Hot Chili Peppers",
+    "Linkin Park",
+    "Siyaahi",
+    "Smoke",
+    "Joji",
+    "Joyner Lucas",
+    "Taba Chake",
+    "The Smiths",
+    "J. Cole",
+    "Pink Floyd",
+    "A.R. Rahman",
+    "Mac Miller",
+    "Arijit Singh",
+    "System Of A Down",
+    "Nanku",
+    "Metallica",
+    "Peter Cat Recording Co.",
+    "Tame Impala",
+    "Shankar-Ehsaan-Loy",
+    "Kendrick Lamar",
+    "Car Seat Headrest",
+    "Sachin-Jigar",
+    "Bharat Chauhan",
+    "Shashwat Sachdev",
+    "vichaar"
+  ]
+}

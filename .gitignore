@@ -1,0 +1,59 @@
+# Credentials and machine-local state
+.env
+.env.*
+!.env.example
+/.cache/
+/.claude/
+/local/
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.lock
+
+# Environments, downloaded runtimes and generated caches
+/.venv*/
+/.tools/
+/.assistant-baselines/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+node_modules/
+
+# Voice recordings, models, private labels and experimental output
+/assistant/logs/
+/assistant/models/
+/assistant/experimental/wake_train/proposals/
+/assistant/experimental/wake_train/*.json
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.ppn
+*.onnx
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.npy
+*.npz
+*.pkl
+
+# Separate product: its source is being relocated outside this repository
+/token_tracker/
+/requirements-token-tracker.txt
+/scripts/*token_tracker.ps1
+/tests/test_token_tracker*
+/tests/test_claude_cache.py
+/tests/test_limit_reset.py
+/design/token_tracker_ui_audit*
+
+# Personal conversation exports and unrelated document/design artifacts
+/ASSISTANT_PLAN.md
+/chat_transcript.md
+/iwanttobuildrefactoreddusk.md
+/memory-router-handout.md
+/*.docx
+/*.psd
+/linkedin banner.png
