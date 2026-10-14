@@ -63,6 +63,48 @@ def app_for_session(monkeypatch, segments, *, initial=""):
     return app, mic, pointer
 
 
+def app_for_managed_capture(monkeypatch, *, initial="", overflow_on_read=False,
+                            expire_before_read=False, stop_on_read=False):
+    app, mic, pointer = app_for_session(monkeypatch, [], initial=initial)
+    pointer.frame_ms = 32.0
+    pointer.timeout_frames = 468
+    pointer.utterance_frames = 625
+    pointer.max_frames = 0 if expire_before_read else 1093
+    pointer.silence_frames = 2
+    pointer.threshold = 0.35
+    app.async_capture = SimpleNamespace(
+        started=True, closed=False, foreground_authorized=True)
+
+    class Vad:
+        def __init__(self):
+            self.scores = iter([0.9] + [0.0] * 10)
+            self.calls = 0
+
+        def reset(self):
+            pass
+
+        def __call__(self, _frame):
+            self.calls += 1
+            return next(self.scores, 0.0)
+
+    app.vad = Vad()
+    mic.queue_overflow_count = 0
+    reads = []
+
+    def read(timeout_s):
+        assert 0 < timeout_s <= 0.05
+        reads.append(timeout_s)
+        if stop_on_read:
+            app._stop.set()
+        if overflow_on_read:
+            mic.queue_overflow_count += 1
+        return np.zeros(512, dtype=np.int16)
+
+    mic.read.side_effect = read
+    mic.vad_frame = lambda frame: frame
+    return app, mic, pointer, reads
+
+
 def test_dictation_does_not_use_music_parser_and_sends_only_after_review(monkeypatch):
     app, mic, pointer = app_for_session(monkeypatch, ['Keep "play red" unchanged.', "Finish.", "Send it."])
     app._parse_intent = Mock(side_effect=AssertionError("Music parsing must not see dictation"))
@@ -76,6 +118,206 @@ def test_dictation_does_not_use_music_parser_and_sends_only_after_review(monkeyp
     assert [call.kwargs["after_prompt"] for call in pointer.record.call_args_list] == [False, False, False]
     assert [call.kwargs["silence_ms"] for call in main.Endpointer.call_args_list] == [1000, 1000, 600]
     assert not app.global_assistant.session.active
+
+
+@pytest.mark.parametrize("initial,mode", [("", "dictation"), ("draft", "confirmation")])
+def test_global_reply_helper_accepts_managed_capture_modes(monkeypatch, initial, mode):
+    app, mic, pointer, reads = app_for_managed_capture(monkeypatch, initial=initial)
+    captured = app._record_foreground_reply(
+        mic, pointer, mode=mode, turn_id="global-test-turn", generation=0)
+
+    assert captured["capture_status"] == "complete"
+    assert captured["speech_started"] is True
+    assert captured["audio"].size == 3 * 512
+    assert len(reads) == app.vad.calls == 3
+
+
+@pytest.mark.parametrize("failure", ["gap", "deadline"])
+def test_global_incomplete_managed_capture_never_reaches_stt_or_submit(
+        monkeypatch, failure):
+    app, mic, _pointer, reads = app_for_managed_capture(
+        monkeypatch, overflow_on_read=failure == "gap",
+        expire_before_read=failure == "deadline")
+    app.global_assistant.consume = Mock(side_effect=AssertionError("incomplete capture consumed"))
+    captured_values = []
+    record = app._record_foreground_reply
+
+    def record_and_keep_result(*args, **kwargs):
+        captured = record(*args, **kwargs)
+        captured_values.append(captured)
+        return captured
+
+    app._record_foreground_reply = record_and_keep_result
+    event = main.Event(event_id="global-incomplete")
+
+    app._run_global_session(mic, event)
+
+    expected_reason = "capture_limit" if failure == "deadline" else failure
+    assert event.capture_end_reason == expected_reason
+    assert captured_values[0]["capture_status"] == failure
+    assert captured_values[0]["audio"].size == 0
+    assert app.stt.transcribe.call_count == 0
+    app.global_assistant.consume.assert_not_called()
+    app.global_assistant.submit_confirmed.assert_not_called()
+    assert reads == ([] if failure == "deadline" else [pytest.approx(0.05)])
+
+
+def test_global_capture_requires_suspend_acknowledgement(monkeypatch):
+    app, mic, _pointer, reads = app_for_managed_capture(monkeypatch)
+    app.async_capture.foreground_authorized = False
+    app.global_assistant.consume = Mock(side_effect=AssertionError("capture was not authorized"))
+
+    with pytest.raises(RuntimeError, match="not authorized"):
+        app._run_global_session(mic, main.Event(event_id="global-no-ack"))
+
+    assert reads == []
+    assert app.stt.transcribe.call_count == 0
+    app.global_assistant.consume.assert_not_called()
+    app.global_assistant.submit_confirmed.assert_not_called()
+
+
+def test_global_stop_during_managed_capture_returns_silently(monkeypatch):
+    app, mic, _pointer, reads = app_for_managed_capture(
+        monkeypatch, stop_on_read=True)
+    app.global_assistant.consume = Mock(side_effect=AssertionError("cancelled capture consumed"))
+    event = main.Event(event_id="global-stop")
+
+    app._run_global_session(mic, event)
+
+    assert event.outcome == "global_cancelled"
+    assert len(reads) == 1
+    assert app.feedback.say.call_count == 0
+    assert app.stt.transcribe.call_count == 0
+    app.global_assistant.consume.assert_not_called()
+    app.global_assistant.submit_confirmed.assert_not_called()
+
+
+def test_global_session_replaced_after_capture_cannot_consume_or_end_replacement(monkeypatch):
+    from assistant.global_commands import VoiceSession
+
+    app, mic, pointer, _reads = app_for_managed_capture(monkeypatch)
+    controller = app.global_assistant
+    replacement = VoiceSession()
+    replacement.select("thr_replacement", "Replacement")
+    replacement.begin("New session must remain active.")
+    real_capture = app._record_foreground_reply
+
+    def replace_after_complete(*args, **kwargs):
+        result = real_capture(*args, **kwargs)
+        controller.session = replacement
+        return result
+
+    app._record_foreground_reply = replace_after_complete
+    controller.consume = Mock(side_effect=AssertionError("replaced capture consumed"))
+    event = main.Event(event_id="global-replaced-after-capture")
+
+    app._run_global_session(mic, event)
+
+    assert event.outcome == "global_cancelled"
+    controller.consume.assert_not_called()
+    controller.submit_confirmed.assert_not_called()
+    assert replacement.active is True
+
+
+def test_global_session_replaced_during_stt_cannot_consume_or_submit(monkeypatch):
+    from assistant.global_commands import VoiceSession
+
+    app, mic, _pointer, _reads = app_for_managed_capture(monkeypatch)
+    controller = app.global_assistant
+    replacement = VoiceSession()
+    replacement.select("thr_replacement", "Replacement")
+    replacement.begin("New session must remain active.")
+
+    def replace_during_stt(_audio):
+        controller.session = replacement
+        return "Send it.", 1
+
+    app.stt.transcribe.side_effect = replace_during_stt
+    controller.consume = Mock(side_effect=AssertionError("stale transcript consumed"))
+    event = main.Event(event_id="global-replaced-during-stt")
+
+    app._run_global_session(mic, event)
+
+    assert event.outcome == "global_cancelled"
+    assert app.stt.transcribe.call_count == 1
+    controller.consume.assert_not_called()
+    controller.submit_confirmed.assert_not_called()
+    assert replacement.active is True
+
+
+@pytest.mark.parametrize("mutation", ["generation", "target_revision"])
+def test_new_intent_same_voice_session_survives_stt(monkeypatch, mutation):
+    app, mic, _pointer, _reads = app_for_managed_capture(monkeypatch)
+    controller = app.global_assistant
+    session = controller.session
+    new_draft = "Fresh request after an intervening new intent."
+
+    def replace_draft_during_stt(_audio):
+        if mutation == "generation":
+            controller._new_intent()
+        else:
+            session.select("thr_replacement", "Replacement")
+        session.begin(new_draft)
+        return "Send it.", 1
+
+    app.stt.transcribe.side_effect = replace_draft_during_stt
+    controller.consume = Mock(side_effect=AssertionError("stale transcript consumed"))
+
+    event = main.Event(event_id="global-generation-fence")
+    app._run_global_session(mic, event)
+
+    assert event.outcome == "global_cancelled"
+    assert controller.session is session
+    assert session.active is True
+    assert session.draft == new_draft
+    controller.consume.assert_not_called()
+    controller.submit_confirmed.assert_not_called()
+
+
+def test_global_capture_uses_current_controller_generation(monkeypatch):
+    app, mic, _pointer, _reads = app_for_managed_capture(
+        monkeypatch, expire_before_read=True)
+    controller = app.global_assistant
+    controller._request_generation = 12
+    observed = []
+    record = app._record_foreground_reply
+
+    def record_with_observation(*args, **kwargs):
+        observed.append(kwargs["generation"])
+        return record(*args, **kwargs)
+
+    app._record_foreground_reply = record_with_observation
+    app._run_global_session(mic, main.Event(event_id="global-generation-value"))
+
+    assert observed == [12]
+    assert app.stt.transcribe.call_count == 0
+    controller.submit_confirmed.assert_not_called()
+
+
+def test_global_session_replaced_while_consuming_cannot_submit(monkeypatch):
+    from assistant.global_commands import VoiceSession
+
+    app, mic, _pointer, _reads = app_for_managed_capture(monkeypatch)
+    controller = app.global_assistant
+    replacement = VoiceSession()
+    replacement.select("thr_replacement", "Replacement")
+    replacement.begin("New session must remain active.")
+
+    def replace_while_consuming(_text):
+        controller.session = replacement
+        return SimpleNamespace(action="submit", target_id="thr_voice",
+                               prompt="Old session prompt.", message="")
+
+    app.stt.transcribe.side_effect = lambda _audio: ("Send it.", 1)
+    controller.consume = Mock(side_effect=replace_while_consuming)
+    event = main.Event(event_id="global-replaced-before-submit")
+
+    app._run_global_session(mic, event)
+
+    assert event.outcome == "global_cancelled"
+    controller.consume.assert_called_once_with("Send it.")
+    controller.submit_confirmed.assert_not_called()
+    assert replacement.active is True
 
 
 def test_readback_audio_is_flushed_before_confirmation(monkeypatch):

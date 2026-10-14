@@ -163,6 +163,45 @@ Acceptance reporting must keep these evidence classes distinct:
   on the existing installed server is a compatibility diagnostic, not equivalent
   to fixed-runtime acceptance.
 - Token Tracker, its active lead, source and startup remain outside this lane.
+- A second accepted source packet centralizes opt-in Codex dictation/review
+  capture without shrinking its speech budget. Generation, target-revision and
+  session-identity fences protect capture, STT and submission; scoped cleanup
+  preserves newer drafts. All 46 global-runtime fixture checks passed, with
+  unchanged before/after source/test fingerprints. Physical Codex navigation
+  and dispatch remain unverified; no real Codex job was created by these checks.
+
+### Installed-server native diagnostic
+
+At source commit `4ac0931`, installed Ollama 0.23.4 and the configured
+`qwen3:4b-instruct-2507-q4_K_M` were used without effects while listening was
+paused. An explicitly separate preparatory request succeeded in 5.647 seconds,
+with provider-observed prompt count 1310 at context 8192. That establishes
+request compatibility, not a correct decision.
+
+The primary probe then stopped after its first case in about 3.03 seconds:
+zero passed, one failed, one attempted. The execution worker's in-memory filter
+used the wrong result-field name and discarded the detailed case row. The exact
+failure category and whether admission or inference failed are not recoverable
+from that retained output. This is **not** a 0/31 accuracy score, nor evidence
+for changing model weights. No retry or held-out run was performed.
+
+The job-created pause flag was removed and fresh logs confirmed listening
+resumed. Original model residency (`keep_alive=-1`) and context 4096 were
+restored. The next diagnostic must retain the actual `failure_category` row,
+distinguish cold preparation/admission/inference, and avoid attributing missing
+evidence to semantic quality. Production remains a one-inference path; the
+experimental token-count preflight must not enter its critical path.
+
+### Speech-model research candidate
+
+The official [Qwen3-ASR repository](https://github.com/QwenLM/Qwen3-ASR)
+documents 0.6B/1.7B multilingual models including English and Hindi, native
+Transformers support, and streaming through vLLM. The 0.6B model is a candidate
+for an isolated recorded-audio comparison, not a proven replacement for the
+current faster-whisper command recognizer. Windows dependency compatibility,
+single-request latency, memory and proper-name accuracy remain unmeasured.
+Do not alter the assistant environment, download/load another resident model,
+or promise the published batched-throughput numbers as laptop latency.
 
 ## Related source of truth
 

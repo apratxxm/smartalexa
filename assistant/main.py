@@ -473,11 +473,28 @@ class Assistant:
         """
         controller = self.global_assistant
         session = controller.session
+        request_generation = getattr(controller, "_request_generation", 0)
+        if (isinstance(request_generation, bool)
+                or not isinstance(request_generation, int) or request_generation < 0):
+            request_generation = 0
+        target_revision = getattr(session, "target_revision", 0)
         start_ms = self.cfg.get("codex.segment_start_timeout_ms", 15000)
         utterance_seconds = self.cfg.get("codex.segment_seconds", 20.0)
         preserve_review = False
+
+        def same_session_context(generation, revision):
+            return (not self._stop.is_set() and controller.session is session
+                    and getattr(controller, "_request_generation", 0) == generation
+                    and getattr(session, "target_revision", 0) == revision)
+
+        def still_owns_session(generation, revision):
+            return same_session_context(generation, revision) and session.active
+
         try:
             while session.active and not self._stop.is_set():
+                if not still_owns_session(request_generation, target_revision):
+                    event.outcome = "global_cancelled"
+                    return
                 # Short confirmations need less trailing silence than dictated
                 # tasks. Neither setting reduces the full speech budget.
                 silence_ms = self.cfg.get(
@@ -493,9 +510,20 @@ class Assistant:
                     threshold=self.cfg.get("capture.vad_threshold", 0.35))
                 with self._duck_music(event, self.cfg.get("ducking.duck_to_percent", 20)):
                     event.mark("global_capture_start", overwrite=True)
-                    captured = pointer.record(mic, after_prompt=False)
+                    capture_mode = "confirmation" if session.phase == "review" else "dictation"
+                    captured = self._record_foreground_reply(
+                        mic, pointer, mode=capture_mode,
+                        turn_id="{}-global-{}".format(event.event_id,
+                                                       time.monotonic_ns()),
+                        generation=request_generation,
+                        cancelled=lambda: not still_owns_session(
+                            request_generation, target_revision))
                     event.mark("global_capture_done", overwrite=True)
                 self._capture_result(event, captured)
+                if (not still_owns_session(request_generation, target_revision)
+                        or captured.get("capture_status") == "superseded"):
+                    event.outcome = "global_cancelled"
+                    return
                 if event.capture_truncated:
                     controller.end_session()
                     self._global_say(mic, "That segment was cut short. Nothing sent. Please start again.", event)
@@ -513,6 +541,9 @@ class Assistant:
                 self.telemetry.save_audio(extra, captured["audio"])
                 with self._discard_while_busy(mic):
                     text, _ = self.stt.transcribe(captured["audio"])
+                if not still_owns_session(request_generation, target_revision):
+                    event.outcome = "global_cancelled"
+                    return
                 extra.trigger_source = "global_dictation"
                 extra.request_phase = session.phase
                 extra.transcript = text
@@ -529,11 +560,32 @@ class Assistant:
                     event.outcome = "global_review_waiting" if preserve_review else "global_unheard"
                     return
                 reply = controller.consume(text)
+                next_generation = getattr(controller, "_request_generation", 0)
+                normalized_control = " ".join(
+                    re.sub(r"[^a-z0-9]+", " ", text.casefold()).split())
+                own_new_intent = (reply.action == "cancel"
+                                  or normalized_control in {
+                                      "start again", "startagain",
+                                      "edit prompt", "editprompt"})
+                if (controller.session is not session
+                        or getattr(session, "target_revision", 0) != target_revision
+                        or (next_generation != request_generation
+                            and not (own_new_intent
+                                     and next_generation == request_generation + 1))):
+                    event.outcome = "global_cancelled"
+                    return
+                # consume() may start a fresh dictated edit or cancel this
+                # session. Adopt only its known one-step transition.
+                request_generation = next_generation
+                target_revision = getattr(session, "target_revision", 0)
                 extra.global_action = reply.action
                 extra.outcome = "global_" + reply.action
                 extra.global_prompt_chars = len(reply.prompt or session.draft)
                 self.telemetry.write(extra)
                 if reply.action == "submit":
+                    if not same_session_context(request_generation, target_revision):
+                        event.outcome = "global_cancelled"
+                        return
                     event.global_target = reply.target_id
                     event.global_prompt_chars = len(reply.prompt)
                     message = controller.submit_confirmed(reply)
@@ -557,7 +609,10 @@ class Assistant:
         finally:
             # Quiet review returns to wake mode; every other exit invalidates it.
             cleanup = getattr(controller, "end_session", None)
-            if not preserve_review or self._stop.is_set():
+            if ((not preserve_review or self._stop.is_set())
+                    and controller.session is session
+                    and getattr(controller, "_request_generation", 0) == request_generation
+                    and getattr(session, "target_revision", 0) == target_revision):
                 if callable(cleanup):
                     cleanup()
                 else:

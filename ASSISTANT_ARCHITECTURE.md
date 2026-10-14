@@ -58,8 +58,14 @@ deadlines during stalls, and returns no PCM for incomplete captures. Its source
 epochs/timestamps are driver-relative receipt metadata, not physical callback
 timing or exact speech-onset evidence.
 
-This is a cooperative foreground migration: dictation and bare-wake recorders
-remain legacy, and listening does not continue during handlers. Both enablement
+Codex dictation and review capture also use this helper in the opt-in path,
+preserving the existing start/speech budgets. Capture, transcription and submit
+boundaries fence session identity, request generation and target revision;
+stale cleanup cannot erase a newer draft, including reuse of the same session
+object. This extension passed 46 focused global-runtime fixture checks.
+
+This is a cooperative foreground migration: bare-wake recorders remain legacy,
+and listening does not continue during handlers. Both enablement
 flags remain false. Focused acceptance on the frozen source: 78 native-diagnostic
 and capture contracts, 79 async/conversation contracts, and 20 selected legacy
 compatibility checks passed. None establishes microphone recall, real model
