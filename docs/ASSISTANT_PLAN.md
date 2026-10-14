@@ -129,6 +129,41 @@ Acceptance reporting must keep these evidence classes distinct:
   that order. Production routing and model promotion remain gated until evidence
   supports them.
 
+## Parallel continuation checkpoint — 2026-10-14
+
+- Restored the existing review server on loopback port 8767. Page and state API
+  returned 200, with exact-span review controls present. This is server/markup
+  evidence, not a new human label or browser interaction acceptance.
+- Fresh no-write preparation: 159 review rows, 149 usable recordings, 10
+  unavailable historical recordings, four unsure excluded, 144 negative train
+  and one negative holdout recording. Positive train and holdout span/session
+  counts remain zero. Training did not run; representative confirmed positives
+  from independent sessions are still required.
+- Added a reproducible, loopback-only native-function diagnostic CLI. It records
+  runtime/tag identity and experimental exact-request admission, invokes no
+  effects, rejects redirects, and bounds response size/socket reads. Together
+  with the managed foreground capture contracts, 78 focused fake/source checks
+  passed at the frozen revision. This is not real-model semantic acceptance.
+- Foreground reply integration passed 79 async/conversation checks plus 20
+  selected legacy compatibility checks behind the existing disabled async path.
+  Lead review corrected an invalid capture-mode enum and missing exception
+  cleanup; fixtures now exercise the real driver with a fake microphone. It
+  requires acknowledged ownership handoff and discards incomplete PCM. It is a
+  cooperative foreground adapter, not continuous listening during handlers or
+  a completed migration of every domain recorder.
+- Runtime inventory found the scheduled assistant using installed Ollama
+  0.23.4: merely downloading 0.31.2 did not select it. The configured executable
+  override was absent and a healthy existing server bypasses binary selection.
+- A controlled task stop quiesced the assistant and its owned server/runner.
+  The host rejected the portable server launch. The unverified executable pin
+  was removed; original task and installed 0.23.4 server were restored. Fresh
+  logs then confirmed the Realtek stream, SoundDrum loopback opening and GPU STT.
+  Portable-runtime inference remains untested; no model was promoted. Never
+  bypass the host restriction. A separately authorized, listening-paused probe
+  on the existing installed server is a compatibility diagnostic, not equivalent
+  to fixed-runtime acceptance.
+- Token Tracker, its active lead, source and startup remain outside this lane.
+
 ## Related source of truth
 
 The architecture, ownership map and acceptance matrix live in

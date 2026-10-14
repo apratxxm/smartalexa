@@ -41,12 +41,29 @@ Held-out wake recall / false activations + real-device acceptance -> manual prom
 | Area | Implemented in source | Still required before claiming it works live |
 |---|---|---|
 | General brain and coordinator | Typed decisions, capability registry, follow-up lifecycle, source-bound evidence and Codex guard | Real-model semantic acceptance, then enable the disabled conversation route |
-| Responsive listening | Serialized recognition jobs, asynchronous segmentation, capture-bound acoustic reservations | Main-loop integration, exclusive legacy handoff, later central capture requests and device timing |
+| Responsive listening | Serialized recognition jobs, asynchronous segmentation, capture-bound acoustic reservations; disabled main-loop integration with acknowledged legacy handoff | Actual device timing and continuous handler capture acceptance |
 | Rejected-wake logging | Bounded archive worker, raw/processed provenance, explicit losses and unknown labels | Connect it to the new runtime path; verify useful rejected captures on devices |
 | Wake learning | Reviewed-span preparation and offline candidate path, provenance and session gates | Confirmed recent positive spans and independent session groups; extraction/training/export and held-out evaluation |
 | Resources | Child process cache/concurrency limits | Installed-runtime adoption and sustained memory/latency measurements |
 | Music, volume, Opera and Codex | Existing adapters plus stronger source/effect contracts | Actual audible/visible end-to-end acceptance; no claim of arbitrary app/page control |
 | Capability expansion | Target design and bounded capability contracts | Retrieved spoken answers, broader verified navigation, Jam QR and interruption remain separate work |
+
+### 14 October foreground-capture continuation
+
+The opt-in async path now routes conversation clarification and shared music
+reply capture through an application-owned `ForegroundCaptureDriver` backed by
+`CaptureRequestManager`. The driver borrows the microphone/VAD only after an
+acknowledged async suspension, scores each acquired frame once, checks wall
+deadlines during stalls, and returns no PCM for incomplete captures. Its source
+epochs/timestamps are driver-relative receipt metadata, not physical callback
+timing or exact speech-onset evidence.
+
+This is a cooperative foreground migration: dictation and bare-wake recorders
+remain legacy, and listening does not continue during handlers. Both enablement
+flags remain false. Focused acceptance on the frozen source: 78 native-diagnostic
+and capture contracts, 79 async/conversation contracts, and 20 selected legacy
+compatibility checks passed. None establishes microphone recall, real model
+semantics or native effects.
 
 ### Earliest live rollout, in order
 

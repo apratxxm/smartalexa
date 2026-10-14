@@ -21,7 +21,8 @@ import numpy as np
 from . import catalogue, ducking, health
 from .audio import Endpointer, Microphone, SileroVAD
 from .config import ROOT, load
-from .diag import EventFormatter, EventIdFilter, WakeTrace, bind_event, unbind_event
+from .diag import (EventFormatter, EventIdFilter, WakeTrace, bind_event,
+                   current_event, unbind_event)
 from .runtime import AlreadyRunning, single_instance
 from .feedback import Feedback, KIND_SPEECH
 from .intent import Action, Intent, parse
@@ -34,6 +35,7 @@ from .telemetry import Event, Telemetry
 from .listener import SttListener
 from .async_runtime import AsyncCaptureRuntime, validate_async_config
 from .async_listener import AcousticProposal
+from .foreground_capture import ForegroundCaptureDriver
 from .power import KeepAwakeGuard
 from .wake import TIER_BOTH, WakeDetector, WakeWordError
 
@@ -687,6 +689,41 @@ class Assistant:
         self._conversation_reply_pointer = pointer
         return pointer
 
+    def _record_foreground_reply(self, mic, pointer, *, mode, turn_id,
+                                 generation=0, cancelled=None):
+        """Use managed capture only while the async owner has yielded the VAD."""
+        runtime = getattr(self, "async_capture", None)
+        if runtime is None:
+            return pointer.record(mic, after_prompt=False)
+        if (not getattr(runtime, "started", False)
+                or getattr(runtime, "closed", True)
+                or not getattr(runtime, "foreground_authorized", False)):
+            raise RuntimeError("async capture has not authorized foreground recording")
+        driver = getattr(self, "_foreground_capture_driver", None)
+        if driver is None:
+            driver = ForegroundCaptureDriver(self.vad)
+            self._foreground_capture_driver = driver
+        frame_ms = float(getattr(pointer, "frame_ms", 32.0))
+        start_timeout = max(0.0, float(getattr(pointer, "timeout_frames", 0))
+                            * frame_ms / 1000.0)
+        duration_frames = (getattr(pointer, "utterance_frames", None)
+                           or getattr(pointer, "max_frames", 0))
+        max_duration = min(30.0, max(frame_ms / 1000.0,
+                                     float(duration_frames) * frame_ms / 1000.0))
+        now = time.monotonic()
+        deadline = min(
+            now + float(getattr(pointer, "max_frames", 0)) * frame_ms / 1000.0,
+            now + start_timeout + max_duration)
+        silence_seconds = max(frame_ms / 1000.0,
+                              float(getattr(pointer, "silence_frames", 0))
+                              * frame_ms / 1000.0)
+        return driver.record(
+            mic, mode=mode, turn_id=turn_id, generation=generation,
+            start_timeout_seconds=start_timeout,
+            max_duration_seconds=max_duration, deadline=deadline,
+            threshold=float(getattr(pointer, "threshold", 0.5)),
+            silence_seconds=silence_seconds, cancelled=cancelled)
+
     def _record_conversation_turn(self, coordinator, generation, user_text, assistant_text):
         recent = getattr(self, "_conversation_recent", None)
         if recent is not None and coordinator.generation == generation:
@@ -774,7 +811,10 @@ class Assistant:
                 child_token = bind_event(child)
                 try:
                     child.mark("capture_start")
-                    captured = pointer.record(mic, after_prompt=False)
+                    captured = self._record_foreground_reply(
+                        mic, pointer, mode="reply",
+                        turn_id=child.event_id, generation=generation,
+                        cancelled=lambda: coordinator.generation != generation)
                     child.mark("capture_done")
                     if captured.get("speech_started"):
                         self.feedback.stopped()
@@ -811,7 +851,8 @@ class Assistant:
             audio = captured.get("audio")
             child.audio_path = self.telemetry.save_audio(child, audio)
             child.mark("reply_capture_saved")
-            if coordinator.generation != generation:
+            if (captured.get("capture_status") == "superseded"
+                    or coordinator.generation != generation):
                 child.conversation_kind = "clarify"
                 child.conversation_status = "invalidated"
                 child.outcome = "conversation_invalidated"
@@ -2310,7 +2351,11 @@ class Assistant:
         if kind != KIND_SPEECH:
             return "", {"audio": np.array([], dtype=np.int16),
                         "speech_started": False, "duration_ms": 0}, 0
-        captured = self.endpointer.record(mic, after_prompt=False)
+        event = current_event()
+        turn_id = (getattr(event, "event_id", None)
+                   or "reply-{}".format(time.monotonic_ns()))
+        captured = self._record_foreground_reply(
+            mic, self.endpointer, mode="reply", turn_id=turn_id)
         if not captured["speech_started"]:
             return "", captured, 0
         self.feedback.stopped()

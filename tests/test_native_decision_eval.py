@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import socket
 
 import pytest
 
@@ -16,6 +17,7 @@ from assistant.experimental.native_decision_eval import (
     build_native_tools,
     decode_native_response,
 )
+import assistant.experimental.native_decision_eval as native_eval
 
 
 def _call(name, arguments, index=None):
@@ -290,3 +292,206 @@ def test_transcript_overflow_and_truncation_are_not_silently_repaired():
         build_native_messages(Transcript("Pause music.", truncated=True), None)
     with pytest.raises(InterpreterFailure, match="transcript_length"):
         build_native_messages(Transcript("x" * 12_001), None)
+
+
+def test_native_probe_uses_loopback_exact_preflight_and_unchanged_real_body(monkeypatch):
+    from assistant.experimental.conversation_eval import EvalCase
+
+    monkeypatch.setattr(native_eval, "CASES", (
+        EvalCase("pause", "Pause the music.", ("plan",), ("pause",)),
+    ))
+    calls = []
+
+    def fake_http(url, payload, timeout):
+        calls.append((url, copy.deepcopy(payload), timeout))
+        if url.endswith("/api/version"):
+            return {"version": "test-version"}
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "test-model", "digest": "abc123"}]}
+        if payload["options"]["num_predict"] == 1:
+            return {"prompt_eval_count": 123}
+        return {"message": {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "pause", "arguments": {}}}
+        ]}}
+
+    metadata, results = native_eval.run_native_probe(
+        url="http://127.0.0.1:11434", model="test-model", max_cases=1,
+        request_json=fake_http)
+    assert metadata["ollama_version"] == "test-version"
+    assert metadata["model_digest"] == "abc123"
+    assert metadata["admission_status"] == "experimental_exact_request_preflight"
+    preflight, real = calls[2][1], calls[3][1]
+    assert preflight["options"]["num_predict"] == 1
+    assert real["options"]["num_predict"] == 384
+    preflight["options"]["num_predict"] = 384
+    assert preflight == real
+    assert results[0]["passed"] is True
+    assert results[0]["admission"]["prompt_tokens"] == 123
+    assert results[0]["admission"]["context_tokens"] == 8192
+    assert all(0 < timeout <= 120 for _, _, timeout in calls)
+
+
+def test_native_probe_rejects_non_loopback_before_any_io():
+    calls = []
+    with pytest.raises(ValueError, match="loopback"):
+        native_eval.run_native_probe(url="http://example.com:11434", model="x",
+                                    request_json=lambda *args: calls.append(args))
+    assert calls == []
+
+
+def test_native_probe_rejects_control_characters_in_server_identity():
+    calls = []
+
+    def fake_http(url, _payload, _timeout):
+        calls.append(url)
+        return {"version": "test\nversion"}
+
+    with pytest.raises(ValueError, match="version response is invalid"):
+        native_eval.run_native_probe(url="http://127.0.0.1:11434", model="x",
+                                    request_json=fake_http)
+    assert calls == ["http://127.0.0.1:11434/api/version"]
+
+
+def test_native_probe_fails_closed_when_admission_count_missing(monkeypatch):
+    from assistant.experimental.conversation_eval import EvalCase
+
+    monkeypatch.setattr(native_eval, "CASES", (
+        EvalCase("pause", "Pause the music.", ("plan",), ("pause",)),
+    ))
+    calls = []
+
+    def fake_http(url, payload, timeout):
+        calls.append(payload)
+        if payload is None:
+            return ({"version": "test"} if url.endswith("/api/version") else
+                    {"models": [{"name": "x", "digest": "digest"}]})
+        return {}
+
+    _, results = native_eval.run_native_probe(url="http://localhost:11434", model="x",
+                                              max_cases=1, request_json=fake_http)
+    assert results[0]["failure_category"] == "interpreter_failure"
+    assert results[0]["admission"] is None
+    assert len(calls) == 3
+
+
+def test_http_json_rejects_oversized_body(monkeypatch):
+    class Response:
+        headers = {"Content-Length": "65537"}
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout > 0
+            return Response()
+
+    monkeypatch.setattr(native_eval.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(ValueError, match="size limit"):
+        native_eval._http_json("http://127.0.0.1/api/version", None, 1)
+
+
+def test_loopback_url_normalizes_localhost_and_keeps_ipv6_brackets():
+    assert native_eval._loopback_base_url("http://localhost:11434") == "http://127.0.0.1:11434/"
+    assert native_eval._loopback_base_url("http://[::1]:11434/") == "http://[::1]:11434/"
+
+
+def test_http_json_rejects_redirect_before_following_it(monkeypatch):
+    opened = []
+
+    class Opener:
+        def __init__(self, handlers):
+            self.handlers = handlers
+
+        def open(self, request, timeout):
+            opened.append(request.full_url)
+            redirect = next(handler for handler in self.handlers
+                            if isinstance(handler, native_eval._NoRedirectHandler))
+            redirect.redirect_request(request, None, 302, "Found", {},
+                                      "http://example.com/collect")
+
+    monkeypatch.setattr(native_eval.urllib.request, "build_opener",
+                        lambda *handlers: Opener(handlers))
+    with pytest.raises(ValueError, match="redirects are not allowed"):
+        native_eval._http_json("http://127.0.0.1/api/version", None, 1)
+    assert opened == ["http://127.0.0.1/api/version"]
+
+
+def test_http_json_reads_in_bounded_chunks_and_preserves_socket_timeout(monkeypatch):
+    class FakeSocket:
+        def __init__(self): self.timeouts = []
+        def settimeout(self, timeout): self.timeouts.append(timeout)
+
+    class Response:
+        headers = {}
+        def __init__(self):
+            self.fp = type("FP", (), {"raw": type("Raw", (), {"_sock": FakeSocket()})()})()
+            self.chunks = [b'{"version":', b'"local"}']
+            self.read_sizes = []
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def read1(self, size):
+            self.read_sizes.append(size)
+            return self.chunks.pop(0) if self.chunks else b""
+
+    response = Response()
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout == 2
+            return response
+
+    monkeypatch.setattr(native_eval.urllib.request, "build_opener", lambda *_args: Opener())
+    assert native_eval._http_json("http://127.0.0.1/api/version", None, 2) == {"version": "local"}
+    assert response.read_sizes == [8192, 8192, 8192]
+    assert len(response.fp.raw._sock.timeouts) == 3
+    assert all(0 < value <= 2 for value in response.fp.raw._sock.timeouts)
+
+
+def test_http_json_enforces_size_limit_without_content_length(monkeypatch):
+    class Response:
+        headers = {}
+        fp = type("FP", (), {"raw": type("Raw", (), {"_sock": type("Sock", (), {
+            "settimeout": lambda _self, _timeout: None})()})()})()
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def read1(self, size): return b"x" * size
+
+    class Opener:
+        def open(self, _request, timeout): return Response()
+
+    monkeypatch.setattr(native_eval.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(ValueError, match="size limit"):
+        native_eval._http_json("http://127.0.0.1/api/version", None, 1)
+
+
+def test_http_json_maps_socket_timeout_to_timeout_error(monkeypatch):
+    class FakeSocket:
+        def settimeout(self, _timeout): pass
+
+    class Response:
+        headers = {}
+        fp = type("FP", (), {"raw": type("Raw", (), {"_sock": FakeSocket()})()})()
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def read1(self, _size): raise socket.timeout("expired")
+
+    class Opener:
+        def open(self, _request, timeout): return Response()
+
+    monkeypatch.setattr(native_eval.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(TimeoutError, match="deadline exceeded"):
+        native_eval._http_json("http://127.0.0.1/api/version", None, 1)
+
+
+def test_native_probe_cli_emits_only_json_and_preserves_nonpromotion(monkeypatch, capsys):
+    monkeypatch.setattr(native_eval, "run_native_probe", lambda **_kwargs: (
+        {"ollama_version": "test", "admission_status": "experimental_exact_request_preflight"},
+        [{"case_id": "pause", "passed": True, "failure_category": None,
+          "kind": "plan", "capabilities": ["pause"], "latency_ms": 1.0,
+          "admission": {"prompt_tokens": 1}}],
+    ))
+    assert native_eval.main(["--model", "test-model", "--max-cases", "1"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0]["metadata"]["admission_status"] == "experimental_exact_request_preflight"
+    assert parsed[1]["case_id"] == "pause"
+    assert parsed[-1]["promotion"] is False

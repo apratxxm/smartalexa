@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 import math
+import socket
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -27,10 +32,14 @@ from ..conversation_brain import (
     _safe_context,
 )
 from ..conversation_contracts import CAPABILITIES, ContractError, Decision, Transcript, validate_decision
+from .conversation_eval import CASES, HELD_OUT_CASES, evaluate
 
 _MAX_TURN_CHARS = 12_000
 _MAX_CONTEXT_BYTES = 3_000
 _MAX_TOOL_CALLS = 4
+_MAX_HTTP_BYTES = 65_536
+_MAX_PROBE_SECONDS = 120.0
+_MAX_CASE_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +51,93 @@ class NativeAdmissionProof:
     context_tokens: int
     model: str
     source: str
+
+
+def _loopback_base_url(value: str) -> str:
+    """Accept only plain HTTP loopback URLs with no credentials or URL suffix."""
+    if not isinstance(value, str) or len(value) > 300:
+        raise ValueError("url must be a loopback Ollama HTTP URL")
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != "http" or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.path not in ("", "/")
+            or parsed.query or parsed.fragment):
+        raise ValueError("url must be a loopback Ollama HTTP URL")
+    host = parsed.hostname.casefold()
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if not loopback:
+        raise ValueError("url must be a loopback Ollama HTTP URL")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("url must have a valid port") from exc
+    if port is None:
+        port = 80
+    normalized_host = f"[{host}]" if ":" in host else ("127.0.0.1" if host == "localhost" else host)
+    return f"http://{normalized_host}:{port}/"
+
+
+def _safe_tag_text(value: Any, limit: int) -> bool:
+    return (isinstance(value, str) and 0 < len(value) <= limit
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject every redirect so a loopback URL cannot pivot to another host."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> Any:
+        raise ValueError("Ollama redirects are not allowed")
+
+
+def _http_json(url: str, payload: dict[str, Any] | None, timeout: float) -> dict[str, Any]:
+    """Perform one proxy-free, response-bounded JSON request."""
+    deadline = time.monotonic() + timeout
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False,
+                                                   separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(url, data=data,
+                                     headers={"Accept": "application/json",
+                                              **({"Content-Type": "application/json"} if data is not None else {})},
+                                     method="GET" if data is None else "POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) > _MAX_HTTP_BYTES:
+                raise ValueError("Ollama response exceeds size limit")
+            raw_parts = bytearray()
+            sock = response.fp.raw._sock
+            while len(raw_parts) <= _MAX_HTTP_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Ollama request deadline exceeded")
+                sock.settimeout(remaining)
+                chunk = response.read1(min(8192, _MAX_HTTP_BYTES + 1 - len(raw_parts)))
+                if not chunk:
+                    break
+                raw_parts.extend(chunk)
+            raw = bytes(raw_parts)
+    except (TimeoutError, socket.timeout):
+        raise TimeoutError("Ollama request deadline exceeded") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise TimeoutError("Ollama request deadline exceeded") from None
+        raise RuntimeError("Ollama request failed") from exc
+    except OSError as exc:
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            raise TimeoutError("Ollama request deadline exceeded") from None
+        raise RuntimeError("Ollama request failed") from exc
+    if len(raw) > _MAX_HTTP_BYTES:
+        raise ValueError("Ollama response exceeds size limit")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Ollama response is not bounded JSON") from exc
+    if not isinstance(result, dict):
+        raise ValueError("Ollama response must be a JSON object")
+    return result
 
 
 def _checked_input(transcript: Transcript, context: dict[str, Any] | None) -> tuple[Transcript, tuple[str, ...]]:
@@ -366,7 +462,133 @@ class NativeDecisionDiagnostic:
             self._lock.release()
 
 
+class _RecordingNativeDiagnostic(NativeDecisionDiagnostic):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.admission_records: list[NativeAdmissionProof | None] = []
+
+    def decide(self, transcript: Transcript, context: dict[str, Any] | None = None) -> Decision:
+        self.last_admission = None
+        try:
+            return super().decide(transcript, context)
+        finally:
+            self.admission_records.append(self.last_admission)
+
+
+def run_native_probe(*, url: str, model: str, max_cases: int = 40,
+                     total_deadline: float = _MAX_PROBE_SECONDS,
+                     per_case_deadline: float = _MAX_CASE_SECONDS,
+                     held_out: bool = False,
+                     request_json: Callable[[str, dict[str, Any] | None, float], dict[str, Any]] | None = None
+                     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run the opt-in native diagnostic against one local Ollama server."""
+    base_url = _loopback_base_url(url)
+    if not _safe_tag_text(model, 200) or not model.strip():
+        raise ValueError("model must be an explicit installed model tag")
+    if (isinstance(total_deadline, bool) or not isinstance(total_deadline, (int, float))
+            or not math.isfinite(total_deadline) or not 0 < total_deadline <= _MAX_PROBE_SECONDS):
+        raise ValueError("total deadline must be >0 and <=120 seconds")
+    if (isinstance(per_case_deadline, bool) or not isinstance(per_case_deadline, (int, float))
+            or not math.isfinite(per_case_deadline) or not 0 < per_case_deadline <= _MAX_CASE_SECONDS):
+        raise ValueError("per-case deadline must be >0 and <=3 seconds")
+    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or not 1 <= max_cases <= 40:
+        raise ValueError("max cases must be 1..40")
+    request_json = request_json or _http_json
+    deadline = time.monotonic() + float(total_deadline)
+
+    def get(path: str) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("native probe total deadline exceeded")
+        return request_json(urllib.parse.urljoin(base_url, path), None, remaining)
+
+    version_payload = get("api/version")
+    version = version_payload.get("version")
+    if not _safe_tag_text(version, 100):
+        raise ValueError("Ollama version response is invalid")
+    tags = get("api/tags").get("models")
+    if not isinstance(tags, list) or len(tags) > 4096:
+        raise ValueError("Ollama tags response is invalid")
+    identity = next((entry for entry in tags if isinstance(entry, dict)
+                     and entry.get("name") == model), None)
+    if identity is None:
+        raise ValueError("explicit model tag is not present in local Ollama tags")
+    digest = identity.get("digest")
+    if not _safe_tag_text(digest, 256):
+        raise ValueError("Ollama model digest is missing or invalid")
+    metadata = {"ollama_version": version, "model": model, "model_digest": digest,
+                "admission_status": NativeDecisionDiagnostic.admission_status,
+                "admission": "separate same-messages/tools/options request with num_predict=1; prompt_eval_count observed",
+                "context_tokens": MODEL_CONTEXT_TOKENS, "output_reserve": OUTPUT_TOKEN_RESERVE,
+                "request_digest": "SHA-256 of canonical original native request (num_predict=384)"}
+
+    def admission(body: dict[str, Any], timeout: float) -> NativeAdmissionProof:
+        preflight = copy.deepcopy(body)
+        preflight["options"]["num_predict"] = 1
+        response = request_json(urllib.parse.urljoin(base_url, "api/chat"), preflight, timeout)
+        count = response.get("prompt_eval_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise InterpreterFailure("native_admission_prompt_count_missing")
+        canonical = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return NativeAdmissionProof(count, hashlib.sha256(canonical).hexdigest(),
+                                    MODEL_CONTEXT_TOKENS, model, "ollama_prompt_eval_count")
+
+    def transport(body: dict[str, Any], timeout: float) -> dict[str, Any]:
+        return request_json(urllib.parse.urljoin(base_url, "api/chat"), body, timeout)
+
+    diagnostic = _RecordingNativeDiagnostic(model, transport, admission,
+                                            timeout=float(per_case_deadline))
+    selected = CASES + HELD_OUT_CASES if held_out else CASES
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("native probe total deadline exceeded before evaluation")
+    results = evaluate(diagnostic, max_cases=max_cases, total_deadline=min(remaining, _MAX_PROBE_SECONDS),
+                       per_case_deadline=float(per_case_deadline), cases=selected)
+    for index, result in enumerate(results):
+        proof = diagnostic.admission_records[index] if index < len(diagnostic.admission_records) else None
+        result["admission"] = (None if proof is None else {
+            "status": NativeDecisionDiagnostic.admission_status,
+            "prompt_tokens": proof.prompt_tokens, "context_tokens": proof.context_tokens,
+            "output_reserve": OUTPUT_TOKEN_RESERVE, "request_sha256": proof.request_sha256,
+            "source": proof.source,
+        })
+    return metadata, results
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Experimental local Ollama native-function probe")
+    parser.add_argument("--url", default="http://127.0.0.1:11434", help="loopback Ollama URL only")
+    parser.add_argument("--model", required=True, help="explicit installed Ollama model tag")
+    parser.add_argument("--max-cases", type=int, default=40)
+    parser.add_argument("--total-deadline", type=float, default=_MAX_PROBE_SECONDS)
+    parser.add_argument("--per-case-deadline", type=float, default=_MAX_CASE_SECONDS)
+    parser.add_argument("--held-out", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        metadata, results = run_native_probe(url=args.url, model=args.model,
+                                             max_cases=args.max_cases,
+                                             total_deadline=args.total_deadline,
+                                             per_case_deadline=args.per_case_deadline,
+                                             held_out=args.held_out)
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")))
+        return 2
+    print(json.dumps({"metadata": metadata}, ensure_ascii=False, separators=(",", ":")))
+    for result in results:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    passed = sum(bool(result["passed"]) for result in results)
+    print(json.dumps({"summary": True, "passed": passed, "failed": len(results) - passed,
+                      "total": len(results), "promotion": False}, separators=(",", ":")))
+    return 0 if passed == len(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "NativeAdmissionProof", "NativeDecisionDiagnostic", "build_native_tools",
-    "build_native_messages", "decode_native_response",
+    "build_native_messages", "decode_native_response", "run_native_probe", "main",
 ]

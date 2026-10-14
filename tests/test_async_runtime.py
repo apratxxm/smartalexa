@@ -165,7 +165,9 @@ def test_runtime_feeds_once_and_frontend_is_the_only_lane_result_drainer():
     assert vad.call_count == 1
 
     assert value.suspend() is True
+    assert value.foreground_authorized is True
     assert value.feed(frame, None, captured_at=2.0, authorization={}) is False
+    assert value.foreground_authorized is False
     assert vad.call_count == 1
     assert value.counters["feed_while_suspended"] == 1
     assert value.resume_if_quiescent() is True
@@ -176,12 +178,26 @@ def test_unacknowledged_suspend_keeps_admission_closed_until_resume_is_safe():
     value.start()
     value.lane.inflight = True
     assert value.suspend(timeout=0) is False
+    assert value.foreground_authorized is False
     assert value.feed(np.zeros(512, dtype=np.int16), None,
                       captured_at=1.0, authorization={}) is False
     assert value.resume_if_quiescent() is False
     assert vad.call_count == 0
     value.lane.inflight = False
     assert value.resume_if_quiescent() is True
+
+
+def test_foreground_authorization_is_revoked_on_resume_attempt_and_close():
+    value, _vad = runtime()
+    value.start()
+    assert value.suspend() is True
+    assert value.foreground_authorized is True
+    assert value.resume_if_quiescent() is True
+    assert value.foreground_authorized is False
+    assert value.suspend() is True
+    assert value.foreground_authorized is True
+    value.close()
+    assert value.foreground_authorized is False
 
 
 def test_owned_diagnostic_is_enqueued_with_stage_capture_and_latencies():

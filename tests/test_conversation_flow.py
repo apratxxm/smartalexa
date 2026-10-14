@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 import threading
 
+import numpy as np
+import pytest
+from unittest.mock import Mock
+
 from assistant.conversation import ConversationCoordinator
 from assistant.conversation_contracts import Decision, Step, ToolResult, Transcript, step_to_intent
 from assistant.intent import Action
@@ -206,7 +210,7 @@ def test_conversation_brain_is_constructed_with_fake_transport_and_readiness(mon
         return {"message": {"content": json.dumps({
             "kind": "answer", "answer": "A virtuoso is a highly skilled performer.",
             "basis": "general_knowledge",
-            "evidence_quotes": ["What does virtuoso mean?"]})}}
+            "evidence_refs": ["c0"]})}}
 
     monkeypatch.setattr(conversation_brain, "_transport", fake_transport)
     assistant = Assistant.__new__(Assistant)
@@ -1094,6 +1098,95 @@ def test_clarification_uses_at_most_two_captures_and_stops_if_generation_stales(
     stale._handle_conversation("Play Madira", object(), stale_event)
     assert stale._conversation_reply_pointer.calls == 0
     assert stale_event.outcome == "conversation_invalidated"
+
+
+def test_foreground_reply_capture_requires_ack_and_uses_real_managed_driver():
+    from assistant.main import Assistant
+
+    pointer = SimpleNamespace(record=Mock(return_value={"audio": "legacy"}),
+                              frame_ms=32.0, timeout_frames=10,
+                              utterance_frames=None, max_frames=100,
+                              silence_frames=5, threshold=0.5)
+    mic = object()
+    assistant = Assistant.__new__(Assistant)
+    assistant.endpointer = pointer
+
+    # The default path retains the old Endpointer contract exactly.
+    assistant.async_capture = None
+    assert assistant._record_foreground_reply(
+        mic, pointer, mode="reply", turn_id="turn-1") == {"audio": "legacy"}
+    pointer.record.assert_called_once_with(mic, after_prompt=False)
+
+    pointer.record.reset_mock()
+    assistant.async_capture = SimpleNamespace(
+        started=True, closed=False, foreground_authorized=False)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        assistant._record_foreground_reply(
+            mic, pointer, mode="reply", turn_id="turn-2")
+    pointer.record.assert_not_called()
+
+    assistant.async_capture.foreground_authorized = True
+
+    class Mic:
+        queue_overflow_count = 0
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, timeout_s):
+            assert 0 < timeout_s <= 0.05
+            self.reads += 1
+            return np.full(512, self.reads, dtype=np.int16)
+
+        @staticmethod
+        def vad_frame(frame):
+            return frame
+
+    class Vad:
+        def __init__(self):
+            self.scores = iter([0.9] + [0.0] * 5)
+            self.calls = 0
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+
+        def __call__(self, _frame):
+            self.calls += 1
+            return next(self.scores, 0.0)
+
+    mic = Mic()
+    assistant.vad = Vad()
+    result = assistant._record_foreground_reply(
+        mic, pointer, mode="reply", turn_id="turn-3", generation=4)
+    assert result["capture_status"] == "complete"
+    assert result["speech_started"] is True
+    assert result["audio"].size == 6 * 512
+    assert assistant.vad.resets == 1
+    assert assistant.vad.calls == mic.reads == 6
+
+
+@pytest.mark.parametrize("status", ["gap", "max_duration", "deadline"])
+def test_ask_and_listen_preserves_incomplete_capture_without_transcribing(status):
+    from assistant.feedback import KIND_SPEECH
+    from assistant.main import Assistant
+
+    assistant = Assistant.__new__(Assistant)
+    assistant.endpointer = SimpleNamespace()
+    assistant._say_feedback = lambda *_args: KIND_SPEECH
+    assistant._record_foreground_reply = lambda *_args, **_kwargs: {
+        "audio": np.array([], dtype=np.int16), "speech_started": False,
+        "capture_status": status, "truncated": False,
+    }
+    assistant.feedback = SimpleNamespace(stopped=lambda: None)
+    assistant._transcribe_captured = lambda *_args: pytest.fail(
+        "incomplete capture must not reach STT")
+
+    text, captured, latency = assistant._ask_and_listen(object(), "Choose one")
+    assert text == ""
+    assert latency == 0
+    assert captured["capture_status"] == status
+    assert captured["audio"].size == 0
 
 
 def test_reply_endpointer_is_lazy_bounded_and_shares_main_vad(monkeypatch):

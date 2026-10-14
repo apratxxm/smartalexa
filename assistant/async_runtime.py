@@ -70,6 +70,9 @@ class AsyncCaptureRuntime:
             cfg, self.observed_vad, self.lane, verify_text=verify_text)
         self.archive = archive_factory(telemetry)
         self.accepting = False
+        # ``accepting`` is a feed policy. Foreground code may borrow the VAD
+        # only after the async frontend confirms it has stopped using it.
+        self.foreground_authorized = False
         self.started = False
         self.closed = False
         self.counters = {
@@ -104,6 +107,7 @@ class AsyncCaptureRuntime:
         return self.observed_vad.last_probability
 
     def start(self):
+        self.foreground_authorized = False
         if self.closed:
             raise RuntimeError("async capture runtime is closed")
         if self.started:
@@ -144,6 +148,7 @@ class AsyncCaptureRuntime:
 
     def feed(self, frame, processed_frame, *, captured_at, authorization,
              acoustic_proposal=None):
+        self.foreground_authorized = False
         if not self.accepting or self.closed:
             self.counters["feed_while_suspended"] += 1
             return False
@@ -170,16 +175,19 @@ class AsyncCaptureRuntime:
         return events
 
     def suspend(self, timeout=None):
+        self.foreground_authorized = False
         if not self.started or self.closed:
             return False
         self.accepting = False
         timeout = (self.HANDOFF_TIMEOUT_SECONDS if timeout is None else timeout)
         acknowledged = self.frontend.suspend(timeout)
+        self.foreground_authorized = bool(acknowledged and self.started and not self.closed)
         if not acknowledged:
             self.counters["suspend_unacknowledged"] += 1
         return acknowledged
 
     def resume_if_quiescent(self):
+        self.foreground_authorized = False
         if not self.started or self.closed or self.accepting:
             return self.accepting
         if self.frontend.resume():
@@ -213,6 +221,7 @@ class AsyncCaptureRuntime:
         return accepted
 
     def close(self, timeout=None):
+        self.foreground_authorized = False
         self.accepting = False
         self.closed = True
         timeout = self.CLOSE_TIMEOUT_SECONDS if timeout is None else timeout
