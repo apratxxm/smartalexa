@@ -12,6 +12,7 @@ import time
 from urllib.parse import quote
 import webbrowser
 
+from .external_apps import external_creation_flags
 from .intent import capability_domain
 
 
@@ -190,7 +191,7 @@ def open_app(name: str) -> str:
     try:
         subprocess.Popen([str(explorer), "shell:AppsFolder\\" + ident], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                         creationflags=external_creation_flags())
     except OSError as exc:
         raise ComputerControlError("The app opening request failed.") from exc
     return "Requested " + label + "."
@@ -219,7 +220,7 @@ def search_browser(query: str, browser: str = "Opera") -> str:
     try:
         subprocess.Popen([str(binary), "--new-tab", url], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                         creationflags=external_creation_flags())
     except OSError as exc:
         raise ComputerControlError("The Opera tab request failed.") from exc
     return "Requested a new Opera search tab."

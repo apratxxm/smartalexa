@@ -48,6 +48,15 @@ Held-out wake recall / false activations + real-device acceptance -> manual prom
 | Music, volume, Opera and Codex | Existing adapters plus stronger source/effect contracts | Actual audible/visible end-to-end acceptance; no claim of arbitrary app/page control |
 | Capability expansion | Target design and bounded capability contracts | Retrieved spoken answers, broader verified navigation, Jam QR and interruption remain separate work |
 
+Runtime lifetime is an ownership boundary too: the Windows supervisor now keeps
+one process-lifetime job handle with kill-on-close and explicit breakaway
+permission. Internal compute children stay contained. Registered user-app and
+browser launches explicitly break away; URI launches use a trusted detached
+Explorer broker. If detaching is denied, opening fails rather than falling back
+to a contained user app. The supervisor does not adopt a pre-existing shared
+Ollama server. Source/fake checks and a throwaway-process native containment
+probe passed; real third-party app navigation remains a separate acceptance.
+
 ### 14 October foreground-capture continuation
 
 The opt-in async path now routes conversation clarification and shared music

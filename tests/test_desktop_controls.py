@@ -15,6 +15,14 @@ def test_chat_link_only_accepts_identifiers():
     assert open_it.call_count == 1
 
 
+def test_default_chat_launcher_maps_breakaway_oserror_to_navigation_error(monkeypatch):
+    import assistant.desktop_controls as controls
+    monkeypatch.setattr(controls.os, "name", "nt")
+    monkeypatch.setattr(controls, "open_external_target", Mock(side_effect=OSError("breakaway denied")))
+    with pytest.raises(NavigationError, match="could not be opened"):
+        controls.open_codex_thread("01a062e2-11a3-7223-8315-df7227b40aa9")
+
+
 @pytest.mark.parametrize("app", ["Codex.exe", "powershell.exe", "notepad.exe", "LockApp.exe"])
 def test_tab_switch_refuses_other_apps(app):
     backend = Mock()

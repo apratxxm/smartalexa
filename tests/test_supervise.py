@@ -108,3 +108,21 @@ def test_explicit_executable_is_selected_and_parallelism_is_forced(tmp_path, mon
     assert supervise.os.environ["LLAMA_ARG_CACHE_RAM"] == "8192"
     assert supervise.os.environ["LLAMA_ARG_CTX_CHECKPOINTS"] == "32"
 
+
+def test_process_lifetime_is_installed_before_server_or_assistant_spawn(monkeypatch):
+    events = []
+    monkeypatch.setattr(supervise.logging, "basicConfig", lambda **_kwargs: None)
+    monkeypatch.setattr(supervise, "install_process_lifetime",
+                        lambda: events.append("install"))
+    monkeypatch.setattr(supervise, "ensure_local_ollama",
+                        lambda: events.append("server"))
+
+    class Child:
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(supervise.subprocess, "Popen",
+                        lambda *args, **kwargs: events.append("assistant") or Child())
+    supervise.main()
+    assert events == ["install", "server", "assistant"]
+

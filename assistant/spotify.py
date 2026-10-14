@@ -26,6 +26,7 @@ from spotipy.oauth2 import SpotifyOAuth
 
 from . import catalogue
 from .config import ROOT, load, secret
+from .external_apps import open_external_target
 from .resolution import (AmbiguousMatch, Candidate, MusicConfirmationRequired,
                           _VERSION_TERMS, _clearly_best, _norm,
                           _strong_match, album_key, best_available_candidate, collapse_reissues,
@@ -647,7 +648,7 @@ class Spotify:
         """
         log.info("Spotify desktop client is closed; opening it.")
         try:
-            os.startfile("spotify:")
+            open_external_target("spotify:")
         except OSError as exc:
             raise RuntimeError("Could not open Spotify via its Windows URI handler") from exc
 
@@ -1677,7 +1678,7 @@ class Spotify:
         local_media.pause()
         with local_media.InvisibleSpotify() as window:
             try:
-                os.startfile(candidate.uri)
+                open_external_target(candidate.uri)
             except OSError as exc:
                 log.warning("Could not open %s in the desktop app: %s", candidate.uri, exc)
                 return False

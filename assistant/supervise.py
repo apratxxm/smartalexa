@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from .config import ROOT, load
+from .process_lifetime import install_process_lifetime
 
 log = logging.getLogger("memoir.supervise")
 OLLAMA_HEALTH = "http://127.0.0.1:11434/api/version"
@@ -111,6 +112,7 @@ def main() -> None:
     logging.basicConfig(
         filename=str(ROOT / "assistant" / "logs" / "supervise.log"),
         level=logging.INFO, format="%(asctime)s %(message)s")
+    install_process_lifetime()
     backoff = 5.0
     while True:
         ensure_local_ollama()

@@ -9,6 +9,8 @@ import sys
 import time
 from typing import Iterable
 
+from .external_apps import open_external_target
+
 
 class SpotifyJamError(RuntimeError):
     """A safe, actionable refusal for an unverified Jam invitation state."""
@@ -318,7 +320,7 @@ class WindowsSpotifyBackend:
         pids = _spotify_pids()
         if not pids:
             try:
-                os.startfile("spotify:")
+                open_external_target("spotify:")
             except OSError as exc:
                 raise SpotifyJamError("Spotify could not be opened through its registered app link.") from exc
         while self.clock() < deadline:

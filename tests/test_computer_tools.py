@@ -42,6 +42,7 @@ def test_open_app_uses_unique_os_catalogue_id_not_heard_shell_or_path(monkeypatc
     argv = launch.call_args.args[0]
     assert argv == [str(Path("C:/Windows/explorer.exe")),
                     "shell:AppsFolder\\OperaSoftware.OperaGXWebBrowser.1720893516"]
+    assert launch.call_args.kwargs["creationflags"] == getattr(tools.subprocess, "CREATE_NO_WINDOW", 0)
     assert "shell" not in launch.call_args.kwargs
     for query in ["cmd.exe /c delete", "C:/Windows/notepad.exe", "Unknown App"]:
         with pytest.raises(tools.ComputerControlError):
@@ -136,6 +137,7 @@ def test_opera_search_is_one_encoded_https_new_tab_not_arbitrary_shell(monkeypat
     argv = launch.call_args.args[0]
     assert argv[:2] == [str(Path("trusted/opera.exe")), "--new-tab"]
     assert argv[2] == "https://www.google.com/search?q=C%2B%2B%20%26%20file%3A%2F%2F%2Fprivate%20%22quote%22"
+    assert launch.call_args.kwargs["creationflags"] == getattr(tools.subprocess, "CREATE_NO_WINDOW", 0)
     assert "Requested" in receipt and "shell" not in launch.call_args.kwargs
     with pytest.raises(tools.ComputerControlError):
         tools.search_browser("logs", "evil.exe")
@@ -174,6 +176,7 @@ def test_show_spotify_uses_bounded_native_search_helper(monkeypatch, kind):
                     "--kind", kind, "--query=Red by Seedhe Maut"]
     assert run.call_args.kwargs["timeout"] == 22.0
     assert run.call_args.kwargs["stdin"] == tools.subprocess.DEVNULL
+    assert run.call_args.kwargs["creationflags"] == getattr(tools.subprocess, "CREATE_NO_WINDOW", 0)
     assert "shell" not in run.call_args.kwargs
     opened.assert_not_called()
 

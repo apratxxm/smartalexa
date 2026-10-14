@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 
+from .external_apps import open_external_target
+
 
 class NavigationError(RuntimeError):
     pass
@@ -20,8 +22,14 @@ def open_codex_thread(thread_id: str, opener=None) -> str:
     if opener is None:
         if os.name != "nt":
             raise NavigationError("Desktop chat navigation requires Windows.")
-        opener = os.startfile
-    opener("codex://threads/" + thread_id)
+        opener = open_external_target
+    target = "codex://threads/" + thread_id
+    try:
+        opener(target)
+    except OSError as exc:
+        if opener is open_external_target:
+            raise NavigationError("The Codex chat could not be opened.") from exc
+        raise
     # Opening a deep link is not proof that the requested chat became visible.
     return "Requested the chat in Codex."
 

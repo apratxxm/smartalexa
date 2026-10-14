@@ -122,8 +122,9 @@ Acceptance reporting must keep these evidence classes distinct:
   exact candidate/runtime identity; no accuracy conclusion is available from the
   absent handoff.
 - Validate the disabled asynchronous idle integration on actual devices, then
-  integrate the central capture-request contract into domain reply/dictation
-  flows. Prior mocks and manager-only checks do not establish continuous processing.
+  complete the remaining bare-wake recorder migration and continuous handler
+  ownership. Reply and Codex dictation/review source integration now exists;
+  its fixture checks do not establish continuous processing or device behavior.
 - Recheck current reviewed wake data and confirm human-span/session provenance.
 - Complete semantic, authority, tool-receipt, live-device and publication gates in
   that order. Production routing and model promotion remain gated until evidence
@@ -169,6 +170,16 @@ Acceptance reporting must keep these evidence classes distinct:
   preserves newer drafts. All 46 global-runtime fixture checks passed, with
   unchanged before/after source/test fingerprints. Physical Codex navigation
   and dispatch remain unverified; no real Codex job was created by these checks.
+- Normal scheduled-task stopping later left old assistant main and Ollama
+  descendants running after the supervisor exited. Cleanup used exact verified
+  PID/start-time/path/ancestry, not process-name-wide kills. A Windows lifetime
+  job now owns compute descendants; explicitly launched user apps/brokers opt
+  out through breakaway flags. Shared pre-existing servers are not adopted.
+  Fifteen lifetime and 88 external-launch fixture checks passed. A standalone
+  native Windows probe confirmed internal-child cleanup, external-child survival,
+  unchanged parent environment and zero remaining test processes. This is not
+  acceptance of Opera/Spotify/Codex UI behavior. Final normal-task adoption is
+  being checked while listening is deliberately paused.
 
 ### Installed-server native diagnostic
 
@@ -191,6 +202,23 @@ restored. The next diagnostic must retain the actual `failure_category` row,
 distinguish cold preparation/admission/inference, and avoid attributing missing
 evidence to semantic quality. Production remains a one-inference path; the
 experimental token-count preflight must not enter its critical path.
+
+### Frozen next packet after grouped review
+
+Separate semantic quality, transport compatibility and audio ownership rather
+than using more protocol tests as evidence for all three. For the first useful
+single-action slice, keep evidence binding, step IDs and dependencies owned by
+the application; ask the model only for the outcome and necessary operation
+arguments. A factual-answer-only slice may use the same completed-turn entry
+point with an explicit empty action set and no executor path. It must not turn a
+failed action interpretation into an answer or claim an effect occurred.
+
+Use one production inference request, preserving whole-turn authority and all
+validation gates. Keep the exact token-count preflight experimental, outside
+the production critical path. Retain the real result rows and measure short
+answers, negative authority, unsupported requests and single actions separately.
+Multi-step actions and always-listening promotion remain gated; do not tune to
+held-out failures, add per-artist repairs, or launch another model concurrently.
 
 ### Speech-model research candidate
 
