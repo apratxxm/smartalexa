@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-/.cache/
+/.cache
 /.claude/
 /local/
 *.db
@@ -48,6 +48,7 @@ node_modules/
 /tests/test_claude_cache.py
 /tests/test_limit_reset.py
 /design/token_tracker_ui_audit*
+/design/
 
 # Personal conversation exports and unrelated document/design artifacts
 /ASSISTANT_PLAN.md

@@ -102,13 +102,19 @@ Acceptance reporting must keep these evidence classes distinct:
   separate Token Tracker product or its history.
 - The local Git repository was prepared on `main` with assistant-only exclusions
   for secrets, models, logs, labels, other-product data and personal exports.
-- No first commit or push was completed at this checkpoint. Do not report source
-  publication as complete.
+- Assistant-only baseline commit `3938aed` was pushed to private
+  `https://github.com/apratxxm/smartalexa` on `main`. Its 204 tracked files exclude
+  the Token Tracker product, shared root ledger, credentials, recordings and
+  model/runtime assets. Local and remote commit IDs matched after publication.
 - Personal exports were relocated to ignored local storage. Branding asset hashes
   were verified. Keep those local-only boundaries intact.
 - This file is the assistant-specific ledger. The repository-root
   `ASSISTANT_PLAN.md` remains the shared/mixed ledger; it is not the authoritative
   assistant-only task list.
+- The user authorized coordination with the active `token tracker` chat. Its
+  lead owns reconciliation and final relocation/startup changes; the prepared
+  sibling checkout is not authority to overwrite that lead's newer edits. This
+  chat leaves original Token Tracker files and its existing scheduled task intact.
 
 ## Active unresolved work
 
