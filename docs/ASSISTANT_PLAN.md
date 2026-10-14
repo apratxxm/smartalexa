@@ -178,8 +178,15 @@ Acceptance reporting must keep these evidence classes distinct:
   Fifteen lifetime and 88 external-launch fixture checks passed. A standalone
   native Windows probe confirmed internal-child cleanup, external-child survival,
   unchanged parent environment and zero remaining test processes. This is not
-  acceptance of Opera/Spotify/Codex UI behavior. Final normal-task adoption is
-  being checked while listening is deliberately paused.
+  acceptance of Opera/Spotify/Codex UI behavior.
+- Final normal-task adoption used accepted source `ce130ab`. The old task tree
+  stopped with zero forced cleanup; the new task started once. Fresh microphone
+  and brain-ready markers appeared, the temporary pause flag was removed, and
+  logs confirmed listening resumed at 17:34:23 followed by capture health.
+  Installed Ollama remains 0.23.4 with the original model/context 4096; both
+  experimental routing flags remain false. The review server still returned
+  200 and no Token Tracker process/startup was changed. This proves startup and
+  capture activity, not spoken wake recall, semantic accuracy or real app effects.
 
 ### Installed-server native diagnostic
 
