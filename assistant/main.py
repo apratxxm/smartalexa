@@ -19,11 +19,14 @@ from contextlib import contextmanager, nullcontext
 import numpy as np
 
 from . import catalogue, ducking, health
-from .audio import Endpointer, Microphone, SileroVAD
+from .audio import DiagnosticPairSnapshot, Endpointer, Microphone, SileroVAD
 from .config import ROOT, load
 from .diag import (EventFormatter, EventIdFilter, WakeTrace, bind_event,
                    current_event, unbind_event)
-from .runtime import AlreadyRunning, single_instance
+from .runtime import (AlreadyRunning, CollectionPauseOverflow,
+                      acknowledge_collection_pauses,
+                      active_collection_pauses, collection_pause_acknowledged,
+                      pause_requested, single_instance)
 from .feedback import Feedback, KIND_SPEECH
 from .intent import Action, Intent, parse
 from .resolution import Candidate, MusicConfirmationRequired, _norm
@@ -138,6 +141,11 @@ def _first_sentence(text: str) -> str:
 class Assistant:
     def __init__(self) -> None:
         self.cfg = load()
+        conversation_interpreter = self.cfg.get("conversation.interpreter", "standard")
+        if (not isinstance(conversation_interpreter, str)
+                or conversation_interpreter not in {"standard", "concise"}):
+            raise ValueError("conversation.interpreter must be 'standard' or 'concise'")
+        self._conversation_interpreter = conversation_interpreter
         self.mode = self.cfg.get("listener.mode", "stt")
         self.duck_trigger = self.cfg.get("ducking.duck_trigger", "wakeword")
         self.async_enabled = validate_async_config(self.cfg)
@@ -147,6 +155,9 @@ class Assistant:
         self._busy = threading.Lock()
         self._trigger = threading.Event()
         self._trigger_source = "hotkey"
+        self._reported_miss_lock = threading.Lock()
+        self._last_reported_miss_at = float("-inf")
+        self._pending_reported_miss_receipt = None
         self._paused_mic = None
         self._paused_listener = None
         self._paused_mic_last_frame_at = 0.0
@@ -237,12 +248,14 @@ class Assistant:
         self.vocabulary = self._load_vocabulary()
         self.brain = None
         self._model_runtime = None
-        if (self.cfg.get("intent.backend") == "brain"
-                or self.cfg.get("conversation.enabled", False) is True):
+        conversation_enabled = self.cfg.get("conversation.enabled", False) is True
+        if self.cfg.get("intent.backend") == "brain" or conversation_enabled:
             from .brain import Brain
             from .model_runtime import LocalModelRuntime
             model = self.cfg.get("intent.model", "qwen3:4b-instruct-2507-q4_K_M")
-            num_ctx = 8192 if self.cfg.get("conversation.enabled", False) is True else 4096
+            num_ctx = 4096
+            if conversation_enabled and self._conversation_interpreter == "standard":
+                num_ctx = 8192
             self._model_runtime = LocalModelRuntime(
                 model, num_ctx=num_ctx, keep_alive=-1, cooldown_seconds=30)
             self.brain = Brain(model,
@@ -633,19 +646,42 @@ class Assistant:
             log.debug("Desktop catalogue warmup unavailable (%s)", type(exc).__name__)
 
     def _listening_paused(self) -> bool:
-        """True while logs/.listening_paused exists (wake-word recording
-        sessions say "Alexa" dozens of times). Checked twice a second."""
+        """Honor manual and collection pauses twice a second."""
         now = time.monotonic()
         if now - getattr(self, "_pause_checked_at", 0.0) >= 0.5:
             self._pause_checked_at = now
             was = getattr(self, "_paused_flag", False)
-            self._paused_flag = PAUSE_FLAG.exists()
+            lease_dir = PAUSE_FLAG.parent / "collection_pauses"
+            overflow = False
+            try:
+                leases = active_collection_pauses(lease_dir)
+            except (CollectionPauseOverflow, OSError, ValueError):
+                leases = []
+                overflow = True
+            self._paused_flag = (overflow or
+                                 pause_requested(PAUSE_FLAG, lease_dir=lease_dir))
+            pending = [item for item in leases
+                       if not collection_pause_acknowledged(lease_dir, item["capture_id"])]
             if self._paused_flag != was:
                 log.info("Listening %s", "paused" if self._paused_flag else "resumed")
                 if self.mode == "stt" and self.listener is not None:
                     self.listener.flush()
                 if self.wake is not None:
                     self.wake.reset()
+            elif self._paused_flag and pending:
+                # A new collection request can arrive while another pause is
+                # already active. Reset buffered context before acknowledging it.
+                if self.mode == "stt" and self.listener is not None:
+                    self.listener.flush()
+                if self.wake is not None:
+                    self.wake.reset()
+            if self._paused_flag and not overflow and (pending or (self._paused_flag != was)):
+                try:
+                    acknowledge_collection_pauses(lease_dir)
+                except (OSError, ValueError):
+                    # A namespace race or invalid private directory keeps the
+                    # assistant paused; collection cannot treat it as ready.
+                    self._paused_flag = True
         return getattr(self, "_paused_flag", False)
 
     def _keep_catalogue_fresh(self) -> None:
@@ -679,11 +715,14 @@ class Assistant:
     def _conversation_instance(self):
         coordinator = getattr(self, "_conversation_coordinator", None)
         if coordinator is None:
-            from .conversation_brain import ConversationBrain
+            if self._conversation_interpreter == "concise":
+                from .concise_brain import ConciseConversationBrain as Interpreter
+            else:
+                from .conversation_brain import ConversationBrain as Interpreter
             from .conversation import ConversationCoordinator
             cfg = getattr(self, "cfg", None)
             get = getattr(cfg, "get", lambda *_: "")
-            interpreter = ConversationBrain(
+            interpreter = Interpreter(
                 get("intent.model", "qwen3:4b-instruct-2507-q4_K_M"),
                 timeout=get("conversation.timeout_seconds", 3.0),
                 readiness=self._conversation_ready,
@@ -745,11 +784,11 @@ class Assistant:
         return pointer
 
     def _record_foreground_reply(self, mic, pointer, *, mode, turn_id,
-                                 generation=0, cancelled=None):
+                                 generation=0, after_prompt=False, cancelled=None):
         """Use managed capture only while the async owner has yielded the VAD."""
         runtime = getattr(self, "async_capture", None)
         if runtime is None:
-            return pointer.record(mic, after_prompt=False)
+            return pointer.record(mic, after_prompt=after_prompt)
         if (not getattr(runtime, "started", False)
                 or getattr(runtime, "closed", True)
                 or not getattr(runtime, "foreground_authorized", False)):
@@ -1368,6 +1407,138 @@ class Assistant:
 
     # ---------- hotkeys ----------
 
+    def _record_reported_miss(self, mic: Microphone) -> bool:
+        """Save a short user-marked window, never an inferred training label."""
+        lock = getattr(self, "_reported_miss_lock", None)
+        if lock is None:
+            lock = self._reported_miss_lock = threading.Lock()
+        now = time.monotonic()
+        with lock:
+            previous = getattr(self, "_last_reported_miss_at", float("-inf"))
+            if now - previous < 2.0:
+                return False
+            self._last_reported_miss_at = now
+        snapshot_end = time.perf_counter()
+        snapshot = getattr(mic, "recent_diagnostic_audio", None)
+        try:
+            pcm = (snapshot(30.0, end_time=snapshot_end) if callable(snapshot)
+                   else np.array([], dtype=np.int16))
+        except Exception as exc:
+            log.warning("Could not snapshot user-marked miss audio (%s)", type(exc).__name__)
+            pcm = np.array([], dtype=np.int16)
+        pair = None
+        paired_snapshot = getattr(mic, "recent_diagnostic_pair", None)
+        if callable(paired_snapshot):
+            try:
+                candidate = paired_snapshot(30.0, end_time=snapshot_end)
+                if isinstance(candidate, DiagnosticPairSnapshot):
+                    pair = candidate
+            except Exception as exc:
+                log.warning("Could not snapshot paired miss diagnostics (%s)", type(exc).__name__)
+        event = Event(trigger_source="miss", outcome="miss_reported",
+                      candidate_kind="user_reported_miss", review_state="unknown",
+                      decision_source="explicit_user_miss_report",
+                      end_reason="user_reported_context_30_seconds",
+                      audio_duration_ms=int(pcm.size * 1000 / self.telemetry.sample_rate))
+        event.segment_id = event.event_id
+        event.audio_path = self.telemetry.save_audio(event, pcm)
+        indexed = self.telemetry.write(event)
+        saved = bool(event.audio_path and event.audio_status == "saved" and indexed)
+        # Both snapshots are already frozen. Optional diagnostics may never
+        # change the parent's receipt or claim sample alignment with its WAV.
+        archive_pair = getattr(self.telemetry, "record_report_diagnostic", None)
+        if pair is not None and callable(archive_pair):
+            try:
+                diagnostic = archive_pair(event, pair.raw, pair.processed,
+                                          coverage=pair.coverage, parent_indexed=indexed)
+                log.info("User-marked paired diagnostic: parent=%s id=%s audio=%s index=%s",
+                         event.event_id, diagnostic.event_id, diagnostic.audio_status,
+                         diagnostic.jsonl_status)
+            except Exception as exc:
+                log.warning("Could not archive paired miss diagnostics: parent=%s error=%s",
+                            event.event_id, type(exc).__name__)
+        log.info("User-marked miss receipt: id=%s status=%s duration_ms=%s",
+                 event.event_id, "saved" if saved else "failed", event.audio_duration_ms)
+        if not saved:
+            log.warning("User-marked miss could not be saved/indexed: id=%s audio=%s index=%s",
+                        event.event_id, event.audio_status, indexed)
+        receipt = ("Saved for review." if saved else "Could not save.", event,
+                   time.monotonic())
+        with lock:
+            # One replaceable slot: repeated reports never build a stale cue
+            # backlog while the audio owner is busy or paused.
+            self._pending_reported_miss_receipt = receipt
+        return saved
+
+    def _drain_reported_miss_receipt(self, mic) -> bool:
+        """Speak one queued report receipt only on the current audio owner."""
+        lock = getattr(self, "_reported_miss_lock", None)
+        if lock is None:
+            lock = self._reported_miss_lock = threading.Lock()
+        with lock:
+            receipt = getattr(self, "_pending_reported_miss_receipt", None)
+        if receipt is None:
+            return False
+        if getattr(self, "_paused_flag", False):
+            return False
+        trigger = getattr(self, "_trigger", None)
+        if trigger is not None and trigger.is_set():
+            return False
+        busy = getattr(self, "_busy", None)
+        if busy is not None and busy.locked():
+            return False
+        listener = getattr(self, "listener", None)
+        message, event, queued_at = receipt
+        age = max(0.0, time.monotonic() - queued_at)
+        if (self.mode == "stt" and getattr(listener, "_in_speech", False)
+                and age < 2.0):
+            return False
+        early_lease = getattr(self, "_early_lease", None)
+        if early_lease is not None and getattr(early_lease, "_owned", False):
+            return False
+        recent_wake = getattr(self, "_last_strong_wake", None)
+        if (recent_wake is not None and time.monotonic() - recent_wake[0] < 2.0
+                and age < 2.0):
+            return False
+
+        with lock:
+            if getattr(self, "_pending_reported_miss_receipt", None) is not receipt:
+                return False
+        attempted = False
+        try:
+            def speak_receipt():
+                with self._duck_music(
+                        event, self.cfg.get("ducking.duck_to_percent", 20)):
+                    self._say_feedback(mic, message, event)
+
+            runtime = getattr(self, "async_capture", None)
+            if runtime is not None:
+                attempted = True
+                delivered = self._run_async_owned_callback(
+                    mic, speak_receipt,
+                    reason="reported miss receipt")
+                if not delivered:
+                    attempted = False
+                    return False
+            else:
+                attempted = True
+                speak_receipt()
+                if self.mode == "stt" and listener is not None:
+                    listener.flush()
+                if self.wake is not None:
+                    self.wake.reset()
+                self._last_strong_wake = None
+        except Exception as exc:
+            log.warning("Could not speak user-marked miss receipt (%s)", type(exc).__name__)
+        finally:
+            # Remove only the receipt that was attempted; a newer callback may
+            # have replaced it while the owner was speaking.
+            with lock:
+                if (attempted and
+                        getattr(self, "_pending_reported_miss_receipt", None) is receipt):
+                    self._pending_reported_miss_receipt = None
+        return attempted
+
     def _start_hotkeys(self, mic: Microphone) -> None:
         if not self.cfg.get("hotkey.enabled", True):
             return
@@ -1384,10 +1555,7 @@ class Assistant:
             to collect negative-space data on wake words that were said and
             missed.
             """
-            event = Event(trigger_source="miss", outcome="miss_reported")
-            event.audio_path = self.telemetry.save_audio(event, mic.ring_contents())
-            self.telemetry.write(event)
-            self.feedback.ok()
+            self._record_reported_miss(mic)
 
         hotkeys = {
             self.cfg.get("hotkey.combo", "<ctrl>+<alt>+<space>"): fire,
@@ -1653,8 +1821,9 @@ class Assistant:
                 self.spotify.pause()
                 event.duck_to = 0
                 event.feedback_kind = self._acknowledge(mic)
-                captured = self.endpointer.record(
-                    mic, after_prompt=self.feedback.speaks_on_wake)
+                captured = self._record_foreground_reply(
+                    mic, self.endpointer, mode="command", turn_id=event.event_id,
+                    after_prompt=self.feedback.speaks_on_wake)
                 if captured["speech_started"]:
                     self.feedback.stopped()
             else:
@@ -1663,8 +1832,9 @@ class Assistant:
                     # the music, and before recording, so we never transcribe
                     # our own voice.
                     event.feedback_kind = self._acknowledge(mic)
-                    captured = self.endpointer.record(
-                        mic, after_prompt=self.feedback.speaks_on_wake)
+                    captured = self._record_foreground_reply(
+                        mic, self.endpointer, mode="command", turn_id=event.event_id,
+                        after_prompt=self.feedback.speaks_on_wake)
                     if captured["speech_started"]:
                         self.feedback.stopped()
 
@@ -2677,7 +2847,11 @@ class Assistant:
             log.info("Wake repeated as the command; still listening")
             with self._duck_music(event, self.cfg.get("ducking.duck_to_percent", 20)):
                 self.feedback.tick()
-                captured = self.endpointer.record(mic, after_prompt=False)
+                captured = self._record_foreground_reply(
+                    mic, self.endpointer, mode="command",
+                    turn_id="{}-repeat-{}".format(
+                        getattr(event, "event_id", "wake"), time.monotonic_ns()),
+                    after_prompt=False)
             self._capture_result(event, captured)
             if not captured["speech_started"]:
                 return "", captured, latency
@@ -3598,6 +3772,8 @@ class Assistant:
                         if self.async_capture is not None:
                             self.async_capture.counters["paused_frames"] += 1
                         continue
+                    if self._drain_reported_miss_receipt(mic):
+                        continue
                     self._sync_paused_mic()
                     if self._trigger.is_set():
                         self._trigger.clear()
@@ -3809,8 +3985,10 @@ class Assistant:
                     if getattr(utt, "completed_at", 0):
                         event.wake_to_ack_ms = int(
                             (time.perf_counter() - utt.completed_at) * 1000)
-                    captured = self.endpointer.record(
-                        mic, after_prompt=self.feedback.speaks_on_wake)
+                    captured = self._record_foreground_reply(
+                        mic, self.endpointer, mode="command",
+                        turn_id="{}-bare-follow-up".format(event.event_id),
+                        after_prompt=self.feedback.speaks_on_wake)
                     if captured["speech_started"]:
                         self.feedback.stopped()
                 event.mark("follow_up_end")
@@ -3883,8 +4061,10 @@ class Assistant:
                         if getattr(utt, "completed_at", 0):
                             event.wake_to_ack_ms = int(
                                 (time.perf_counter() - utt.completed_at) * 1000)
-                        captured = self.endpointer.record(
-                            mic, after_prompt=self.feedback.speaks_on_wake)
+                        captured = self._record_foreground_reply(
+                            mic, self.endpointer, mode="command",
+                            turn_id="{}-bare-follow-up".format(event.event_id),
+                            after_prompt=self.feedback.speaks_on_wake)
                         if captured["speech_started"]:
                             self.feedback.stopped()
                     extra = Event(ts=event.ts, event_id=event.event_id + "-follow-up")

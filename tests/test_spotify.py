@@ -1033,6 +1033,111 @@ def test_player_api_plays_without_opening_the_app(monkeypatch):
     assert opened == []
 
 
+def test_initial_native_unavailable_uses_immediate_exact_api_confirmation(monkeypatch):
+    from contextlib import nullcontext
+    from assistant import local_media
+    from assistant.resolution import Candidate
+
+    sp = Spotify.__new__(Spotify)
+    sp._device_name = "laptop"
+    sp._cfg = SimpleNamespace(get=lambda key, default=None: default)
+    sp.sp = Mock()
+    sp.command_target = lambda: nullcontext()
+    sp.device = lambda: "laptop"
+    sp.sp.current_playback.return_value = {
+        "device": {"id": "laptop"}, "is_playing": True,
+        "item": {"uri": "spotify:track:abc"},
+    }
+    snapshots = Mock(return_value=None)
+
+    def native_wait(predicate, timeout):
+        return predicate()
+
+    monkeypatch.setattr(local_media, "snapshot", snapshots)
+    monkeypatch.setattr(local_media, "_wait_for", native_wait)
+    monkeypatch.setattr(sp, "_play_uri_locally", Mock(side_effect=AssertionError("no fallback")))
+    candidate = Candidate("spotify:track:abc", "Madira", "Seedhe Maut")
+
+    assert sp.play_candidate(candidate) == candidate.label
+
+    snapshots.assert_called_once_with()
+    sp.sp.start_playback.assert_called_once()
+    sp.sp.current_playback.assert_called_once_with()
+    assert sp.last_playback["method"] == "web_api_verified"
+
+
+def test_initial_unavailable_api_visibility_at_two_seconds_fits_old_horizon(monkeypatch):
+    from contextlib import nullcontext
+    from assistant import local_media
+    from assistant.resolution import Candidate
+
+    sp = Spotify.__new__(Spotify)
+    sp._device_name = "laptop"
+    sp._cfg = SimpleNamespace(get=lambda key, default=None: default)
+    sp.sp = Mock()
+    sp.command_target = lambda: nullcontext()
+    sp.device = lambda: "laptop"
+    clock = [0.0]
+    reads = []
+
+    def current_playback():
+        reads.append(clock[0])
+        if clock[0] < 2.0:
+            return None
+        return {"device": {"id": "laptop"}, "is_playing": True,
+                "item": {"uri": "spotify:track:abc"}}
+
+    sp.sp.current_playback.side_effect = current_playback
+    monkeypatch.setattr(local_media, "snapshot", lambda: None)
+    monkeypatch.setattr(local_media, "_wait_for", lambda predicate, timeout: predicate())
+    monkeypatch.setattr("assistant.spotify.time.sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    candidate = Candidate("spotify:track:abc", "Madira", "Seedhe Maut")
+
+    assert sp.play_candidate(candidate) == candidate.label
+    assert len(reads) == 3
+    assert reads[-1] <= 4.75
+    assert sp.last_playback["method"] == "web_api_verified"
+
+
+def test_slow_initial_snapshot_uses_only_remaining_combined_horizon(monkeypatch):
+    from contextlib import nullcontext
+    from assistant import local_media
+    from assistant.resolution import Candidate
+    from assistant.spotify import PlaybackVerificationError
+
+    sp = Spotify.__new__(Spotify)
+    sp._device_name = "laptop"
+    sp._cfg = SimpleNamespace(get=lambda key, default=None: default)
+    sp.sp = Mock()
+    sp.command_target = lambda: nullcontext()
+    sp.device = lambda: "laptop"
+    clock = [0.0]
+    reads = []
+
+    def snapshot():
+        clock[0] += 3.0
+        return None
+
+    def current_playback():
+        reads.append(clock[0])
+        return None
+
+    sp.sp.current_playback.side_effect = current_playback
+    monkeypatch.setattr(local_media, "snapshot", snapshot)
+    monkeypatch.setattr(local_media, "_wait_for", lambda predicate, timeout: predicate())
+    monkeypatch.setattr("assistant.spotify.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("assistant.spotify.time.sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(sp, "_play_uri_locally", Mock(side_effect=AssertionError("no fallback")))
+
+    with pytest.raises(PlaybackVerificationError):
+        sp.play_candidate(Candidate("spotify:track:abc", "Madira", "Seedhe Maut"))
+
+    assert len(reads) == 4
+    assert reads[0] == 3.0
+    assert reads[-1] == pytest.approx(4.75)
+    sp.sp.start_playback.assert_called_once()
+
+
 def test_accepted_api_native_miss_verifies_uri_on_same_pinned_target(monkeypatch, caplog):
     from contextlib import contextmanager
     import logging
@@ -1058,7 +1163,7 @@ def test_accepted_api_native_miss_verifies_uri_on_same_pinned_target(monkeypatch
 
     sp.command_target = target
     sp.device = lambda: active[-1] if active else "unexpected-device-selection"
-    sp._now_playing = lambda candidate, timeout: False
+    sp._now_playing = lambda candidate, timeout, **kwargs: False
     sp.sp.current_playback.return_value = {"device": {"id": "laptop"}, "is_playing": True,
         "item": {"uri": "spotify:track:other", "linked_from": {"uri": "spotify:track:abc"}}}
     monkeypatch.setattr(sp, "_play_uri_locally", Mock(side_effect=AssertionError("no desktop fallback")))
@@ -1078,8 +1183,9 @@ def test_accepted_api_native_miss_verifies_uri_on_same_pinned_target(monkeypatch
     {"device": {"id": "laptop"}, "is_playing": True, "item": {"uri": "spotify:track:wrong"}},
     {"device": {"id": "remote"}, "is_playing": True, "item": {"uri": "spotify:track:abc"}},
     {"device": {"id": "laptop"}, "is_playing": False, "item": {"uri": "spotify:track:abc"}},
+    {"device": {"id": "laptop"}, "is_playing": True},
 ])
-def test_accepted_api_wrong_uri_device_or_paused_never_retries_playback(monkeypatch, state):
+def test_accepted_api_wrong_uri_device_paused_or_empty_never_retries_playback(monkeypatch, state):
     from contextlib import nullcontext
     from assistant.resolution import Candidate
     from assistant.spotify import PlaybackVerificationError
@@ -1090,7 +1196,7 @@ def test_accepted_api_wrong_uri_device_or_paused_never_retries_playback(monkeypa
     sp.sp = Mock()
     sp.command_target = lambda: nullcontext()
     sp.device = lambda: "laptop"
-    sp._now_playing = lambda candidate, timeout: False
+    sp._now_playing = lambda candidate, timeout, **kwargs: None
     sp.sp.current_playback.return_value = state
     desktop = Mock(side_effect=AssertionError("accepted request cannot fall back"))
     monkeypatch.setattr(sp, "_play_uri_locally", desktop)
@@ -1120,7 +1226,7 @@ def test_accepted_api_verification_failure_never_falls_back(monkeypatch, failure
     sp.sp = Mock()
     sp.command_target = lambda: nullcontext()
     sp.device = lambda: "laptop"
-    sp._now_playing = lambda candidate, timeout: False
+    sp._now_playing = lambda candidate, timeout, **kwargs: None
     error = (SpotifyRateLimited("Bearer secret-token response-body") if failure == "rate_limited"
              else SpotifyRequestDeferred("budget secret-token response-body"))
     sp.sp.current_playback.side_effect = error
@@ -1254,11 +1360,26 @@ def test_now_playing_accepts_exact_playing_snapshot(monkeypatch):
     assert sp._now_playing(Candidate("spotify:track:abc", "Madira", "Seedhe Maut"), 1)
 
 
+def test_initial_unavailable_is_not_sticky_for_later_native_confirmation(monkeypatch):
+    from assistant import local_media
+    from assistant.resolution import Candidate
+
+    sp = Spotify.__new__(Spotify)
+    states = [None, SimpleNamespace(title="Madira", artist="Seedhe Maut", playing=True)]
+    monkeypatch.setattr(local_media, "snapshot", lambda: states.pop(0))
+    monkeypatch.setattr(local_media, "_wait_for", lambda predicate, timeout: predicate())
+    candidate = Candidate("spotify:track:abc", "Madira", "Seedhe Maut")
+
+    assert sp._now_playing(candidate, 4.0, initial_unavailable=True) is None
+    assert sp._now_playing(candidate, 4.0, initial_unavailable=True) is True
+
+
 @pytest.mark.parametrize(
     ("current", "play_result"),
     [
         (SimpleNamespace(title="Madira", artist="Seedhe Maut", playing=False), True),
         (SimpleNamespace(title="Madira", artist="Other Artist", playing=True), False),
+        (None, False),
     ],
 )
 def test_local_playback_does_not_accept_paused_or_wrong_artist(monkeypatch, current, play_result):
@@ -1484,6 +1605,31 @@ def test_quota_metadata_survives_other_guard_write(tmp_path):
         second.current_playback()
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["quota"]["web"]["retry_until"] is None
+
+
+def test_quota_updates_propagate_when_file_timestamp_does_not_change(tmp_path):
+    import os
+    import spotipy
+    from assistant.spotify import SpotifyQuotaExceeded, _RateLimitGuard
+
+    path = tmp_path / "backoff.json"
+    writer, observer = _RateLimitGuard(Mock(), path), _RateLimitGuard(Mock(), path)
+    writer._client.search.side_effect = spotipy.SpotifyException(
+        429, -1, "limited", reason="QUOTA_EXCEEDED", headers={})
+    with pytest.raises(SpotifyQuotaExceeded):
+        writer.search(q="x")
+    assert observer.quota_status()["web"]["reason"] == "QUOTA_EXCEEDED"
+    timestamp = path.stat().st_mtime_ns
+    writer.clear_quota("web")
+    os.utime(path, ns=(timestamp, timestamp))
+    assert observer.quota_status() == {}
+    with pytest.raises(SpotifyQuotaExceeded):
+        writer.search(q="x")
+    os.utime(path, ns=(timestamp, timestamp))
+    assert observer.quota_status()["web"]["reason"] == "QUOTA_EXCEEDED"
+    with pytest.raises(SpotifyQuotaExceeded):
+        observer.search(q="x")
+    observer._client.search.assert_not_called()
 
 
 def test_quota_clear_propagates_to_guard_with_stale_cached_quota(tmp_path):

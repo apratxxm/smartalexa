@@ -1,0 +1,35 @@
+# Phase 1 live trial script. Read by assistant/core/trials.py.
+# Gate: docs/STRATEGY.md, "Phases and gates", phase 1 row. Thresholds must match it.
+timeout_seconds: 25
+thresholds:
+  music: 7        # of 8
+  volume: 4       # of 4
+  questions: 3    # of 4
+  negatives: 4    # of 4 in the normal run, and 4 of 4 in the outage run
+# mode: normal = run with the provider up; outage = run with MEMOIR_CORE_PROVIDER_OUTAGE=1.
+# kind is required for negatives: tv, codex_question, correction, truncated.
+lines:
+  - {id: M1, mode: normal, category: music, phrase: "Alexa, play Halo by Beyonce"}
+  - {id: M2, mode: normal, category: music, phrase: "Alexa, pause"}
+  - {id: M3, mode: normal, category: music, phrase: "Alexa, resume"}
+  - {id: M4, mode: normal, category: music, phrase: "Alexa, next"}
+  - {id: M5, mode: normal, category: music, phrase: "Alexa, play Crazy in Love by Beyonce"}
+  - {id: M6, mode: normal, category: music, phrase: "Alexa, pause the music"}
+  - {id: M7, mode: normal, category: music, phrase: "Alexa, resume the music"}
+  - {id: M8, mode: normal, category: music, phrase: "Alexa, next song"}
+  - {id: V1, mode: normal, category: volume, phrase: "Alexa, set the volume to 40"}
+  - {id: V2, mode: normal, category: volume, phrase: "Alexa, turn the volume up"}
+  - {id: V3, mode: normal, category: volume, phrase: "Alexa, turn the volume down"}
+  - {id: V4, mode: normal, category: volume, phrase: "Alexa, set the volume to 25"}
+  - {id: Q1, mode: normal, category: questions, phrase: "Alexa, what does virtuoso mean?"}
+  - {id: Q2, mode: normal, category: questions, phrase: "Alexa, what is the capital of France?"}
+  - {id: Q3, mode: normal, category: questions, phrase: "Alexa, how many ounces are in a pound?"}
+  - {id: Q4, mode: normal, category: questions, phrase: "Alexa, who wrote Hamlet?"}
+  - {id: N1, mode: normal, category: negatives, kind: tv, phrase: "Alexa, order a pizza.", note: "Say it yourself (lead 27 Oct: replaces TV audio). Unsupported request; must cause no action."}
+  - {id: N2, mode: normal, category: negatives, kind: codex_question, phrase: "Alexa, what is Codex used for?", note: "Question containing Codex. Must not trigger Codex."}
+  - {id: N3, mode: normal, category: negatives, kind: correction, phrase: "Alexa, play Halo, actually never mind.", note: "Mid-sentence correction. The prefix must not run."}
+  - {id: N4, mode: normal, category: negatives, kind: truncated, phrase: "Alexa, set the volume to", note: "Stop after 'to' (lead 28 Oct: bare 'play' is a valid resume, so it can't test truncation)."}
+  - {id: O1, mode: outage, category: negatives, kind: tv, phrase: "Alexa, order a pizza.", note: "Say it yourself (lead 27 Oct: replaces TV audio). Unsupported request; must cause no action."}
+  - {id: O2, mode: outage, category: negatives, kind: codex_question, phrase: "Alexa, what is Codex used for?", note: "Question containing Codex. Must not trigger Codex."}
+  - {id: O3, mode: outage, category: negatives, kind: correction, phrase: "Alexa, play Halo, actually never mind.", note: "Mid-sentence correction. The prefix must not run."}
+  - {id: O4, mode: outage, category: negatives, kind: truncated, phrase: "Alexa, set the volume to", note: "Stop after 'to' (lead 28 Oct: bare 'play' is a valid resume, so it can't test truncation)."}

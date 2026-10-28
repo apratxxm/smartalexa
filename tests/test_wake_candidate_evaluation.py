@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import wave
 
@@ -85,11 +86,11 @@ def test_no_overwrite_atomic_json_create(tmp_path):
 
 
 def test_module_import_is_cold_and_does_not_import_ml_stack():
-    assert "onnxruntime" not in sys.modules
-    # NumPy may be imported by pytest itself; importing this module does not
-    # eagerly require AudioFeatures, ONNX Runtime, or Torch.
-    assert "openwakeword.utils" not in sys.modules
-    assert "torch" not in sys.modules
+    code = ("import sys; import assistant.experimental.wake_train.candidate_evaluation; "
+            "assert not any(name in sys.modules for name in "
+            "('onnxruntime', 'openwakeword.utils', 'torch'))")
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_memory_gate_precedes_frontend_factory_and_ml_scoring(monkeypatch, tmp_path):

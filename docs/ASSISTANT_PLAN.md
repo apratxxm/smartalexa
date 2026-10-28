@@ -1,246 +1,27 @@
-# SmartAlexa assistant requirements and status
+# SmartAlexa — active checkpoint
 
-Updated 2026-10-14. This ledger is for the assistant product only. It records
-requirements and evidence checkpoints; planned behavior and passing checks do not
-prove deployment or live acceptance.
+Updated 2026-10-27. Read on resume; material updates only. Plan of record: [STRATEGY.md](STRATEGY.md) (rev 2) + [CAPABILITY_CONTRACT.md](CAPABILITY_CONTRACT.md). The project is a git repo with uncommitted work (last commit 1053e14).
 
-## Product scope
+**Runtime state:** assistant stopped; startup task disabled since 18 Oct. `[runtime] runtime = "legacy"` default; core via `runtime = "core"` or `python -m assistant.core`. `[core] enabled_phases = ["1"]`, so only phase 1 is reachable.
 
-SmartAlexa is a private, local-first Windows assistant for general conversation
-and bounded computer actions. “Memoir” is the historical checkout/package name.
-The user wants an assistant that handles whole turns, ordinary questions and
-follow-ups naturally, then uses explicit typed plans for actions. The goal is not
-a collection of phrase-specific command patches.
+## Accepted source (not live)
 
-Requested behavior includes:
+- **Core runtime** `assistant/core/**`: fail-closed adapter registry; allow-list whole-utterance grammar (old regex removed) with C1 exact-match for suspicious objects; typed receipts; guards before every mutation; wake-boundary trimming; free hosted brain (Cloudflare default, Groq alt) + grammar-gated fallback; outage switch `MEMOIR_CORE_PROVIDER_OUTAGE=1`; selfcheck lists capabilities. 1095+ core tests pass (lead rerun). Corpus: `tests/core/corpus/authority.yaml` (236).
+- **Adapters (disabled by default):** music 1b (album/artist/playlist/queue/previous/restart), computer 3 (apps incl. .lnk→exe, Opera search, show song/album), codex 3 (needs `[core.codex] project_dir`), jam 4, knowledge 4 (Wikipedia; `[core] knowledge = false`).
+- **Reviews:** Sol diff reviews on phase 1 (2 rounds). Phase 3 batch: Sol r1 (F1–F8) + r2 (F1/F3/F4/F5/F7 narrower, new F9: codex request representation) all fixed; lead verified every Sol counterexample (27 Oct). Debate closed; residual risk = free-text Codex withdrawals (denylist + first-person refusal + Codex-side preamble), checked by the live gate. Codex requests containing "I" as a word are refused by design.
+- **Tests:** full `pytest tests`: only 45 failures, all out of scope (33 global_assistant/conversation_flow = delete-candidates, pre-existing; 12 token_tracker = separate product). Kept-module failures fixed 28 Oct (test-state leaks; spotify quota file read without mtime shortcut).
+- **Trial harness** `python -m assistant.core.trials {phase1,phase1b,phase3,phase4} [--outage]`, `--combine`; scripts `docs/trials/*.yaml` (every line checked against the real grammar; 1b/4 thresholds provisional). Phase 1 truncated negative is now "Alexa, set the volume to"; grammar accepts "set the volume to N".
+- **Phase 5 plan** `docs/research/PHASE5_PLAN.md`: Sol design review done 28 Oct (lifecycle + legacy-startup gates folded in). Two user calls, both "retain" recommended: manual CLIs/knowledge_retrieval; stored artifacts.
+- **Wake:** bench + recorder; synthetic candidate `models/wake/candidates/20261027-synthtts-lessac/alexa_synth.onnx` (provisional; synthetic held-out recall 0.944 vs stock 0.778 @0.5). Not wired.
+- **Cutover map** `docs/research/CUTOVER_MAP.md` (re-run before phase 5; `.env` excluded from the backup).
 
-- Answer definitions, explanations, trivia and general questions briefly and naturally. Do not route ordinary questions to Codex or an action by default.
-- Understand corrections, compound requests, references, clarification answers, cancellations and topic changes across a whole turn.
-- Play, pause, resume, skip, queue and search; distinguish track, album and artist. Preserve supplied artist context; restart and “show” are distinct from playback.
-- Control Windows master volume only for explicit commands. Music ducking is a Spotify-session effect and restores the prior session level.
-- Open/search in the browser, show known apps/music/chats, and perform supported desktop actions through registered capabilities with observed results. No arbitrary app/page control claims.
-- Dispatch Codex only when the whole current request explicitly authorizes it. Quoted text, code, ambiguity, revocation and cancellation grant no authority. Create, submit, open and report status as separate verified effects.
-- Wake over music and during normal use with measured first-attempt recall, false activations and wake-to-feedback latency. Keep responses short and confirmations tied to verified results.
+## Waiting on the user
 
-## Architecture and safety invariants
+1. Free keys (`CF_ACCOUNT_ID`, `CF_API_TOKEN`, optional `GROQ_API_KEY`) → `python -m assistant.core --eval`.
+2. Phase 1 live trial (normal + outage) with normal apps open.
+3. Wake Day A/B recordings → bench incl. the synthetic candidate.
+4. Codex project dir for delegation; whether shells (cmd/PowerShell) may be opened by voice (currently allowed).
 
-- One application-owned capture/VAD/ASR path and conversation owner; adapters do not listen or speak independently.
-- Interpret the complete admitted turn. The model proposes a typed answer, clarification, no-request, unsupported result or ordered plan; code owns schemas, state, authority, cancellation and effects.
-- A capability registry defines argument/result contracts and verifiers. Validate plans against the source turn, registry, evidence, numbers and independent policy. A citation or registry entry is not user intent.
-- Bind wake confirmation and command audio to the same capture, interval and generation. Late confirmation cannot authorize a stale/partial prefix.
-- One executor returns receipts distinguishing accepted, completed, failed, cancelled and unknown delivery. Verify visible/audible/native outcomes; do not repeat uncertain mutations on restart.
-- Cancellation and newer turns fence stale results. Ambiguous/revoked Codex authority blocks dispatch; quoted instructions remain data.
-- Unsupported work is explicit. Unknown intent never falls through to Codex, Spotify or another capability; do not add phrase-specific exceptions.
-- Keep local-first processing, secrets, recordings, labels, weights, logs and personal exports out of source publication.
+## Rules carried forward
 
-## Current gates
-
-### Source and configuration
-
-- Legacy Spotify and desktop adapters exist; source presence does not prove current end-to-end behavior.
-- Typed decision and asynchronous capture/request contracts exist, but the central manager is not a complete continuous-processing path.
-- `listener.async_enabled` and `conversation.enabled` are false in `assistant/config.toml`; keep both gated until their acceptance criteria pass.
-- Wikipedia retrieval is not a complete spoken web-answer flow. `native_decision_eval` is diagnostic, not production acceptance.
-- Synthetic scores, mocks and offline suites do not establish natural answers, microphone recall, playback, visible effects or live Codex behavior.
-
-### Model and runtime evidence
-
-- 2026-10-13: fixed portable Ollama 0.31.2 resolved a formatting issue from 0.30.0. The exact invalid-prefix prompt returned an accepted pause plan; this proves formatting repair on that path, not general accuracy.
-- 2026-10-13: warmed strict three-second compact-protocol run passed 16/28 primary cases before stopping. Failures included invented actions, playlist scope, correction/clarification and invalid plans. Median decision latency: 1,937.5 ms. No effects ran; no promotion.
-- Last observed 24-case comparison scored 11/24 for both old `qwen3:4b-instruct` and `qwen3.5:4b`; neither qualified. This is historical synthetic evidence, not a fresh result from the repository setup.
-- Native experimental adapter: 39 fake/source checks. Latest native real-model probe has no durable handoff in this resumed tree, so its accuracy is unverified—not passed or failed.
-- Earlier disabled async idle integration/main mocks reported 306 checks; `CaptureRequest` manager 18; review UI 89, including an actual DOM-tag correction. These do not accept continuous capture or live devices.
-
-### Wake data and learning
-
-- 2026-10-13 review snapshot: zero confirmed positive Alexa groups for training; four presence-only/uncertain clips. Older 59 enrollment positives are separate historical data, not new ground truth or independent-session evidence.
-- Prior inventory: 149 usable recordings, four unsure excluded, zero positive train/holdout groups, 144 negative train and one negative holdout. Recheck counts and provenance before citing them as current.
-- Exact human-reviewed spans are required for positives. Detector/ASR is a proposal only. Never auto-label, convert unsure to positive, or promote without independent-session holdouts and held-out evaluation.
-- No physical wake-recall target (including 95%), sustained listening, device behavior or retraining readiness is established by source/mock checks.
-
-### Live and deployed behavior
-
-- Spotify, Windows volume, browser and Codex adapters have historical bounded checks. Current playback, volume effects, navigation, Codex actions and restart reconciliation still need acceptance.
-- Source checks do not prove installed task/process state, model loading, devices, live inference, wake-over-music or deployed flags. Verify at rollout.
-- Keep routing disabled until semantic/authority acceptance, safe integration handoff and a small live wake/response/effect slice pass.
-
-## Acceptance order
-
-1. Recheck current source/configuration and the installed process/task state without
-   changing user data or unrelated applications.
-2. Accept the existing disabled asynchronous idle integration in the intended
-   runtime/device slice, preserving exclusive legacy handoff, stale-result
-   fencing and explicit failure behavior. Its source checks already passed;
-   rerun them only if their relevant files or contracts change.
-3. Re-run the fixed, held-out whole-turn semantic and authority corpus on the exact
-   candidate runtime; report exact decisions, invalid plans and latency. Do not
-   use diagnostic ablations as production results.
-4. Accept conversation lifecycle and capability receipts: clarification, follow-up,
-   cancellation, timeout, partial success, unknown delivery and restart recovery.
-5. Validate bounded real effects independently: a short answer, one music request,
-   Windows volume, browser display/search and explicitly authorized Codex routing.
-6. Run an authorized small live wake-to-feedback slice and inspect audible/visible
-   outcomes. Keep unsupported cases disabled and record limits.
-7. Centralize domain-owned capture, then complete retrieved spoken answers,
-   navigation and genuine human-reviewed wake-data collection. Train only after the
-   provenance, session and holdout gates are met.
-
-Acceptance reporting must keep these evidence classes distinct:
-
-| Evidence | Establishes | Does not establish |
-| --- | --- | --- |
-| Source review | Implemented branches and configured defaults | Correct model meaning or live effects |
-| Unit/mock checks | Deterministic contracts under fixtures | Microphone, GPU inference or native apps |
-| Synthetic model evaluation | Candidate behavior on that fixed prompt/corpus | Recorded/live speech or held-out generalization |
-| Recorded-device probe | Behavior on the identified files/devices | Continuous listening or future-room recall |
-| Live vertical slice | Observed behavior in the tested session | Broad reliability, training readiness or deployment safety |
-
-## Private source repository checkpoint — 2026-10-14
-
-- A private GitHub repository named `smartalexa` was created using the existing
-  Git credential. This is the assistant's source destination; do not include the
-  separate Token Tracker product or its history.
-- The local Git repository was prepared on `main` with assistant-only exclusions
-  for secrets, models, logs, labels, other-product data and personal exports.
-- Assistant-only baseline commit `3938aed` was pushed to private
-  `https://github.com/apratxxm/smartalexa` on `main`. Its 204 tracked files exclude
-  the Token Tracker product, shared root ledger, credentials, recordings and
-  model/runtime assets. Local and remote commit IDs matched after publication.
-- Personal exports were relocated to ignored local storage. Branding asset hashes
-  were verified. Keep those local-only boundaries intact.
-- This file is the assistant-specific ledger. The repository-root
-  `ASSISTANT_PLAN.md` remains the shared/mixed ledger; it is not the authoritative
-  assistant-only task list.
-- The user authorized coordination with the active `token tracker` chat. Its
-  lead owns reconciliation and final relocation/startup changes; the prepared
-  sibling checkout is not authority to overwrite that lead's newer edits. This
-  chat leaves original Token Tracker files and its existing scheduled task intact.
-
-## Active unresolved work
-
-- Recover or repeat the native real-model acceptance with a durable result and
-  exact candidate/runtime identity; no accuracy conclusion is available from the
-  absent handoff.
-- Validate the disabled asynchronous idle integration on actual devices, then
-  complete the remaining bare-wake recorder migration and continuous handler
-  ownership. Reply and Codex dictation/review source integration now exists;
-  its fixture checks do not establish continuous processing or device behavior.
-- Recheck current reviewed wake data and confirm human-span/session provenance.
-- Complete semantic, authority, tool-receipt, live-device and publication gates in
-  that order. Production routing and model promotion remain gated until evidence
-  supports them.
-
-## Parallel continuation checkpoint — 2026-10-14
-
-- Restored the existing review server on loopback port 8767. Page and state API
-  returned 200, with exact-span review controls present. This is server/markup
-  evidence, not a new human label or browser interaction acceptance.
-- Fresh no-write preparation: 159 review rows, 149 usable recordings, 10
-  unavailable historical recordings, four unsure excluded, 144 negative train
-  and one negative holdout recording. Positive train and holdout span/session
-  counts remain zero. Training did not run; representative confirmed positives
-  from independent sessions are still required.
-- Added a reproducible, loopback-only native-function diagnostic CLI. It records
-  runtime/tag identity and experimental exact-request admission, invokes no
-  effects, rejects redirects, and bounds response size/socket reads. Together
-  with the managed foreground capture contracts, 78 focused fake/source checks
-  passed at the frozen revision. This is not real-model semantic acceptance.
-- Foreground reply integration passed 79 async/conversation checks plus 20
-  selected legacy compatibility checks behind the existing disabled async path.
-  Lead review corrected an invalid capture-mode enum and missing exception
-  cleanup; fixtures now exercise the real driver with a fake microphone. It
-  requires acknowledged ownership handoff and discards incomplete PCM. It is a
-  cooperative foreground adapter, not continuous listening during handlers or
-  a completed migration of every domain recorder.
-- Runtime inventory found the scheduled assistant using installed Ollama
-  0.23.4: merely downloading 0.31.2 did not select it. The configured executable
-  override was absent and a healthy existing server bypasses binary selection.
-- A controlled task stop quiesced the assistant and its owned server/runner.
-  The host rejected the portable server launch. The unverified executable pin
-  was removed; original task and installed 0.23.4 server were restored. Fresh
-  logs then confirmed the Realtek stream, SoundDrum loopback opening and GPU STT.
-  Portable-runtime inference remains untested; no model was promoted. Never
-  bypass the host restriction. A separately authorized, listening-paused probe
-  on the existing installed server is a compatibility diagnostic, not equivalent
-  to fixed-runtime acceptance.
-- Token Tracker, its active lead, source and startup remain outside this lane.
-- A second accepted source packet centralizes opt-in Codex dictation/review
-  capture without shrinking its speech budget. Generation, target-revision and
-  session-identity fences protect capture, STT and submission; scoped cleanup
-  preserves newer drafts. All 46 global-runtime fixture checks passed, with
-  unchanged before/after source/test fingerprints. Physical Codex navigation
-  and dispatch remain unverified; no real Codex job was created by these checks.
-- Normal scheduled-task stopping later left old assistant main and Ollama
-  descendants running after the supervisor exited. Cleanup used exact verified
-  PID/start-time/path/ancestry, not process-name-wide kills. A Windows lifetime
-  job now owns compute descendants; explicitly launched user apps/brokers opt
-  out through breakaway flags. Shared pre-existing servers are not adopted.
-  Fifteen lifetime and 88 external-launch fixture checks passed. A standalone
-  native Windows probe confirmed internal-child cleanup, external-child survival,
-  unchanged parent environment and zero remaining test processes. This is not
-  acceptance of Opera/Spotify/Codex UI behavior.
-- Final normal-task adoption used accepted source `ce130ab`. The old task tree
-  stopped with zero forced cleanup; the new task started once. Fresh microphone
-  and brain-ready markers appeared, the temporary pause flag was removed, and
-  logs confirmed listening resumed at 17:34:23 followed by capture health.
-  Installed Ollama remains 0.23.4 with the original model/context 4096; both
-  experimental routing flags remain false. The review server still returned
-  200 and no Token Tracker process/startup was changed. This proves startup and
-  capture activity, not spoken wake recall, semantic accuracy or real app effects.
-
-### Installed-server native diagnostic
-
-At source commit `4ac0931`, installed Ollama 0.23.4 and the configured
-`qwen3:4b-instruct-2507-q4_K_M` were used without effects while listening was
-paused. An explicitly separate preparatory request succeeded in 5.647 seconds,
-with provider-observed prompt count 1310 at context 8192. That establishes
-request compatibility, not a correct decision.
-
-The primary probe then stopped after its first case in about 3.03 seconds:
-zero passed, one failed, one attempted. The execution worker's in-memory filter
-used the wrong result-field name and discarded the detailed case row. The exact
-failure category and whether admission or inference failed are not recoverable
-from that retained output. This is **not** a 0/31 accuracy score, nor evidence
-for changing model weights. No retry or held-out run was performed.
-
-The job-created pause flag was removed and fresh logs confirmed listening
-resumed. Original model residency (`keep_alive=-1`) and context 4096 were
-restored. The next diagnostic must retain the actual `failure_category` row,
-distinguish cold preparation/admission/inference, and avoid attributing missing
-evidence to semantic quality. Production remains a one-inference path; the
-experimental token-count preflight must not enter its critical path.
-
-### Frozen next packet after grouped review
-
-Separate semantic quality, transport compatibility and audio ownership rather
-than using more protocol tests as evidence for all three. For the first useful
-single-action slice, keep evidence binding, step IDs and dependencies owned by
-the application; ask the model only for the outcome and necessary operation
-arguments. A factual-answer-only slice may use the same completed-turn entry
-point with an explicit empty action set and no executor path. It must not turn a
-failed action interpretation into an answer or claim an effect occurred.
-
-Use one production inference request, preserving whole-turn authority and all
-validation gates. Keep the exact token-count preflight experimental, outside
-the production critical path. Retain the real result rows and measure short
-answers, negative authority, unsupported requests and single actions separately.
-Multi-step actions and always-listening promotion remain gated; do not tune to
-held-out failures, add per-artist repairs, or launch another model concurrently.
-
-### Speech-model research candidate
-
-The official [Qwen3-ASR repository](https://github.com/QwenLM/Qwen3-ASR)
-documents 0.6B/1.7B multilingual models including English and Hindi, native
-Transformers support, and streaming through vLLM. The 0.6B model is a candidate
-for an isolated recorded-audio comparison, not a proven replacement for the
-current faster-whisper command recognizer. Windows dependency compatibility,
-single-request latency, memory and proper-name accuracy remain unmeasured.
-Do not alter the assistant environment, download/load another resident model,
-or promise the published batched-throughput numbers as laptop latency.
-
-## Related source of truth
-
-The architecture, ownership map and acceptance matrix live in
-[`../ASSISTANT_ARCHITECTURE.md`](../ASSISTANT_ARCHITECTURE.md). This ledger tracks
-assistant requirements and checkpoints; update statuses only when a new result is
-available, with the evidence type and date stated.
+Volume = Windows master only. $0. Only post-wake transcript leaves (plus Wikipedia for asked questions). No confirmations. Phase 5 deletion approved with a zip (no `.env`) + restore test.

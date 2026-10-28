@@ -21,12 +21,13 @@ from __future__ import annotations
 import argparse
 import collections
 from contextlib import contextmanager
+from dataclasses import dataclass
 import logging
 import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import numpy as np
 
@@ -37,6 +38,13 @@ SILERO_URL = (
     "src/silero_vad/data/silero_vad.onnx"
 )
 SILERO_PATH = Path(__file__).resolve().parent / "models" / "silero_vad.onnx"
+
+
+@dataclass(frozen=True)
+class DiagnosticPairSnapshot:
+    raw: np.ndarray
+    processed: Optional[np.ndarray]
+    coverage: Mapping[str, object]
 
 
 def ensure_silero() -> Path:
@@ -169,6 +177,21 @@ class Microphone:
         self._ring: collections.deque = collections.deque(maxlen=max_frames)
         self._clean_ring: collections.deque = collections.deque(maxlen=max_frames)
         self._lock = threading.Lock()
+        # Explicit miss reports need recent capture even when the consumer is
+        # stalled or the live path has been flushed. Keep raw native-rate
+        # chunks separately; this history is never used for recognition.
+        self._diagnostic_seconds = 30.0
+        self._diagnostic_sample_limit = int(self.capture_rate * self._diagnostic_seconds)
+        self._diagnostic_history: collections.deque = collections.deque()
+        self._diagnostic_samples = 0
+        self._diagnostic_lock = threading.Lock()
+        self._pair_history: collections.deque = collections.deque()
+        self._pair_samples = 0
+        self._pair_lock = threading.Lock()
+        self._pair_generation = 0
+        self._pair_read_id = 0
+        self._pair_failure_markers: collections.deque = collections.deque(maxlen=64)
+        self._pair_flush_after_tail = False
         self._stream = None
 
         # Audio-thread handoff. The callback only appends; all work happens in
@@ -178,6 +201,10 @@ class Microphone:
         self.queue_overflow_count = 0
         self._reported_overflow_count = 0
         self._last_overflow_warning = None
+        self._callback_status_count = 0
+        self._reported_callback_status_count = 0
+        self._last_callback_status = None
+        self._last_callback_status_warning = None
         self._discard_depth = 0
         self.intentional_discard_count = 0
         self._pending = np.array([], dtype=np.int16)
@@ -197,15 +224,248 @@ class Microphone:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         """Audio thread: copy in and get out. No processing here."""
+        # Retain only bounded metadata here; read() reports it off-thread.
         if status:
-            log.debug("Input status: %s", status)
+            self._last_callback_status = status
+            self._callback_status_count += 1
+        import time as _time
+        stamp = _time.perf_counter()
+        data = indata[:, 0].copy()
+        diagnostic_chunk = data
+        # Bound by samples as well as chunk count: a malformed oversized
+        # callback block must not exceed the thirty-second diagnostic budget.
+        if diagnostic_chunk.size > self._diagnostic_sample_limit:
+            diagnostic_chunk = diagnostic_chunk[-self._diagnostic_sample_limit:]
+        data.setflags(write=False)
+        with self._diagnostic_lock:
+            self._diagnostic_history.append((stamp, diagnostic_chunk))
+            self._diagnostic_samples += diagnostic_chunk.size
+            cutoff = stamp - self._diagnostic_seconds
+            while self._diagnostic_history:
+                oldest_stamp, oldest = self._diagnostic_history[0]
+                oldest_start = oldest_stamp - oldest.size / self.capture_rate
+                expired = int(max(0.0, cutoff - oldest_start) * self.capture_rate)
+                if expired:
+                    trim = min(expired, oldest.size)
+                    self._diagnostic_samples -= trim
+                    if trim == oldest.size:
+                        self._diagnostic_history.popleft()
+                    else:
+                        self._diagnostic_history[0] = (oldest_stamp, oldest[trim:])
+                    continue
+                if self._diagnostic_samples > self._diagnostic_sample_limit:
+                    trim = self._diagnostic_samples - self._diagnostic_sample_limit
+                    trim = min(trim, oldest.size)
+                    self._diagnostic_samples -= trim
+                    if trim == oldest.size:
+                        self._diagnostic_history.popleft()
+                    else:
+                        self._diagnostic_history[0] = (oldest_stamp, oldest[trim:])
+                    continue
+                break
         if self._discard_depth:
             self.intentional_discard_count += 1
             return
-        import time as _time
         if len(self._queue) == self._queue.maxlen:
             self.queue_overflow_count += 1
-        self._queue.append((_time.perf_counter(), indata[:, 0].copy()))
+        self._queue.append((stamp, data))
+
+    def _clear_diagnostic_history(self) -> None:
+        with self._diagnostic_lock:
+            self._diagnostic_history.clear()
+            self._diagnostic_samples = 0
+
+    def recent_diagnostic_audio(self, seconds: float = 30.0, *,
+                                end_time: Optional[float] = None) -> np.ndarray:
+        """Return a copied mono 16 kHz snapshot of recent raw mic capture."""
+        seconds = float(seconds)
+        if not np.isfinite(seconds) or seconds < 0:
+            raise ValueError("seconds must be finite and non-negative")
+        seconds = min(seconds, self._diagnostic_seconds)
+        if seconds <= 0:
+            return np.array([], dtype=np.int16)
+        now = time.perf_counter() if end_time is None else float(end_time)
+        if not np.isfinite(now):
+            raise ValueError("end_time must be finite")
+        cutoff = now - seconds
+        chunks = []
+        with self._diagnostic_lock:
+            for stamp, chunk in self._diagnostic_history:
+                if stamp > now:
+                    continue
+                chunk_start = stamp - chunk.size / self.capture_rate
+                first = max(0, int((cutoff - chunk_start) * self.capture_rate))
+                if first < chunk.size:
+                    chunks.append(chunk[first:].copy())
+        if not chunks:
+            return np.array([], dtype=np.int16)
+        native = np.concatenate(chunks)
+        if self.capture_rate != self.sample_rate:
+            import soxr
+            converted = soxr.resample(native.astype(np.float32), self.capture_rate,
+                                      self.sample_rate)
+        else:
+            converted = native
+        return np.clip(converted, -32768, 32767).astype(np.int16, copy=True)
+
+    def _append_diagnostic_pair(self, raw: np.ndarray, processed: Optional[np.ndarray],
+                                completed: float, source_end: float) -> None:
+        """Best-effort bounded record retention; never participates in recognition."""
+        reserved = False
+        failed_completed = 0.0
+        try:
+            completed = float(completed)
+            failed_completed = completed
+            source_end = (float(source_end) if source_end is not None else None)
+            if source_end is not None and not np.isfinite(source_end):
+                source_end = None
+            echo = ((id(self.echo), id(getattr(self.echo, "reference", None)),
+                     getattr(getattr(self.echo, "reference", None), "generation", None))
+                    if self.echo is not None else None)
+            with self._pair_lock:
+                record = {
+                    "id": self._pair_read_id, "generation": self._pair_generation,
+                    "state": "pending", "raw": None, "processed": None,
+                    "completed": completed, "source_end": source_end,
+                    "overflow": self.queue_overflow_count,
+                    "status": self._callback_status_count,
+                    "discard": self.intentional_discard_count, "echo": echo,
+                }
+                self._pair_history.append(record)
+                reserved = True
+                self._pair_read_id += 1
+                self._pair_flush_after_tail = False
+                self._trim_diagnostic_pairs_locked(completed)
+
+            raw_copy = np.asarray(raw, dtype=np.int16).reshape(-1).copy()
+            clean_copy = None
+            if (isinstance(processed, np.ndarray) and processed.ndim == 1
+                    and processed.dtype == np.int16 and processed.shape == raw_copy.shape):
+                clean_copy = processed.copy()
+            with self._pair_lock:
+                if (any(item is record for item in self._pair_history)
+                        and record["generation"] == self._pair_generation
+                        and record["state"] == "pending"):
+                    record["raw"] = raw_copy
+                    record["processed"] = clean_copy
+                    record["state"] = "available"
+                    self._pair_samples += raw_copy.size
+                    self._trim_diagnostic_pairs_locked(completed)
+                elif (any(item is record for item in self._pair_history)
+                      and record["state"] == "pending"):
+                    record["state"] = "failed"
+        except Exception:
+            with self._pair_lock:
+                if reserved:
+                    if (any(item is record for item in self._pair_history)
+                            and record["state"] == "pending"):
+                        record["state"] = "failed"
+                else:
+                    failed_id = self._pair_read_id
+                    self._pair_read_id += 1
+                    try:
+                        self._pair_failure_markers.append({
+                            "id": failed_id, "generation": self._pair_generation,
+                            "state": "failed", "raw": None, "processed": None,
+                            "completed": failed_completed, "source_end": None,
+                            "overflow": self.queue_overflow_count,
+                            "status": self._callback_status_count,
+                            "discard": self.intentional_discard_count, "echo": None,
+                        })
+                    except Exception:
+                        pass
+
+    def _trim_diagnostic_pairs_locked(self, completed: float) -> None:
+        while (self._pair_history and
+               (self._pair_samples > 480000 or len(self._pair_history) > 4096 or
+                completed - self._pair_history[0]["completed"] > 30.0)):
+            old = self._pair_history.popleft()
+            if old["raw"] is not None:
+                self._pair_samples -= old["raw"].size
+
+    def recent_diagnostic_pair(self, seconds: float = 30.0, *,
+                               end_time: Optional[float] = None) -> DiagnosticPairSnapshot:
+        seconds = float(seconds)
+        if not np.isfinite(seconds) or seconds < 0:
+            raise ValueError("seconds must be finite and non-negative")
+        seconds = min(seconds, 30.0)
+        end = time.perf_counter() if end_time is None else float(end_time)
+        if not np.isfinite(end):
+            raise ValueError("end_time must be finite")
+        start = end - seconds
+        with self._pair_lock:
+            records = [dict(r) for r in self._pair_history if r["completed"] <= end
+                       and r["completed"] >= start]
+            records.extend(dict(r) for r in self._pair_failure_markers
+                            if r["completed"] <= end and r["completed"] >= start)
+            records.sort(key=lambda r: r["id"])
+            generation = self._pair_generation
+            flush_tail = self._pair_flush_after_tail
+        codes = []
+        selected = []
+        if records:
+            latest = records[-1]
+            if latest["state"] == "pending":
+                codes.append("read_id_gap")
+            elif latest["state"] == "failed":
+                codes.append("pair_append_failure")
+            elif latest["processed"] is None:
+                codes.append("inactive_or_invalid_clean")
+            else:
+                selected = [latest]
+                for prev in reversed(records[:-1]):
+                    nxt = selected[0]
+                    if prev["state"] in ("pending", "failed"):
+                        codes.append("pair_append_failure" if prev["state"] == "failed"
+                                     else "read_id_gap")
+                        if prev["generation"] != nxt["generation"]:
+                            codes.append("flush")
+                        break
+                    reasons = []
+                    if prev["id"] + 1 != nxt["id"]: reasons.append("read_id_gap")
+                    if prev["generation"] != nxt["generation"]: reasons.append("flush")
+                    if prev["overflow"] != nxt["overflow"]: reasons.append("callback_overflow")
+                    if prev["status"] != nxt["status"]: reasons.append("callback_status")
+                    if prev["discard"] != nxt["discard"]: reasons.append("intentional_discard")
+                    if prev["echo"] != nxt["echo"]: reasons.append("echo_generation")
+                    if prev["processed"] is None or nxt["processed"] is None: reasons.append("inactive_or_invalid_clean")
+                    if (prev["source_end"] is not None and nxt["source_end"] is not None
+                            and prev["source_end"] >= nxt["source_end"]):
+                        reasons.append("nonmonotonic_source_time")
+                    if reasons:
+                        codes.extend(reasons)
+                        break
+                    selected.insert(0, prev)
+        if flush_tail and selected:
+            codes.append("flush_after_tail")
+        raw = np.concatenate([r["raw"] for r in selected]).copy() if selected else np.array([], dtype=np.int16)
+        processed = (np.concatenate([r["processed"] for r in selected]).copy()
+                     if selected and all(r["processed"] is not None for r in selected)
+                     else None)
+        if len(codes) > 12: codes = codes[:12]
+        source_start = None
+        source_end = None
+        if (selected and selected[0]["source_end"] is not None
+                and selected[-1]["source_end"] is not None):
+            source_start = selected[0]["source_end"] - selected[0]["raw"].size / 16000
+            source_end = selected[-1]["source_end"]
+        completed_start = selected[0]["completed"] if selected else None
+        completed_end = selected[-1]["completed"] if selected else None
+        coverage = {
+            "version": 1, "sample_rate": 16000, "clock": "perf_counter",
+            "window_start": start, "window_end": end,
+            "diagnostic_generation": selected[0]["generation"] if selected else generation,
+            "read_start": selected[0]["id"] if selected else None,
+            "read_end_exclusive": selected[-1]["id"] + 1 if selected else None,
+            "retained_samples": int(raw.size), "estimated_source_start": source_start,
+            "estimated_source_end": source_end, "read_completed_start": completed_start,
+            "read_completed_end": completed_end, "pairing": "read_invocation",
+            "sample_alignment": "unverified", "capture_continuity": "unverified",
+            "padding_possible": True,
+            "status": "available" if selected and not codes else "partial" if selected else "failed" if "pair_append_failure" in codes else "missing",
+            "break_reasons": codes,
+        }
+        return DiagnosticPairSnapshot(raw, processed, coverage)
 
     def reopen(self) -> None:
         """Recover the same microphone after sleep without reloading models."""
@@ -277,6 +537,13 @@ class Microphone:
         self._resampler = None
         self._queue.clear()
         self._pending = np.array([], dtype=np.int16)
+        self._clear_diagnostic_history()
+        with self._pair_lock:
+            self._pair_generation += 1
+            self._pair_history.clear()
+            self._pair_samples = 0
+            self._pair_flush_after_tail = False
+            self._pair_failure_markers.clear()
 
     def read(self, timeout_s: float = 3.0) -> np.ndarray:
         """Block until one frame is available; append it to the ring buffer.
@@ -294,6 +561,14 @@ class Microphone:
                             self.queue_overflow_count)
                 self._last_overflow_warning = now
                 self._reported_overflow_count = self.queue_overflow_count
+        if self._callback_status_count != self._reported_callback_status_count:
+            now = _time.monotonic()
+            if (self._last_callback_status_warning is None
+                    or now - self._last_callback_status_warning >= 5.0):
+                log.warning("Microphone callback reported status %s (%d event(s)).",
+                            self._last_callback_status, self._callback_status_count)
+                self._last_callback_status_warning = now
+                self._reported_callback_status_count = self._callback_status_count
         deadline = _time.monotonic() + timeout_s
         # Streaming resamplers emit variable-sized chunks, including empty
         # chunks during filter startup. Preserve every sample; never pad or trim.
@@ -335,6 +610,11 @@ class Microphone:
             # Archive only confirmed active AEC output, and own the buffer in
             # case the implementation reuses it on the next read.
             clean_frame = clean.copy()
+        completed = _time.perf_counter()
+        unread = (self._output_pending.size / self.sample_rate
+                  + self._pending.size / self.capture_rate)
+        source_end = self._last_chunk_time - unread
+        self._append_diagnostic_pair(frame, clean_frame, completed, source_end)
         with self._lock:
             self._ring.append(frame)
             paired_ring = getattr(self, "_clean_ring", None)
@@ -355,6 +635,9 @@ class Microphone:
         Called after the assistant speaks, so its own prompt never lands in the
         recording it is about to make.
         """
+        with self._pair_lock:
+            self._pair_generation += 1
+            self._pair_flush_after_tail = bool(self._pair_history)
         self._queue.clear()
         self._pending = np.array([], dtype=np.int16)
         self._output_pending = np.array([], dtype=np.float32)

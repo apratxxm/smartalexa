@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import socket
+import time
 
 import pytest
 
@@ -494,4 +495,125 @@ def test_native_probe_cli_emits_only_json_and_preserves_nonpromotion(monkeypatch
     parsed = [json.loads(line) for line in lines]
     assert parsed[0]["metadata"]["admission_status"] == "experimental_exact_request_preflight"
     assert parsed[1]["case_id"] == "pause"
+    assert set(parsed[1]) == {"case_id", "passed", "failure_category", "kind",
+                             "capabilities", "latency_ms", "admission"}
     assert parsed[-1]["promotion"] is False
+
+
+def test_failed_preflight_is_persisted_with_outer_failure_category(monkeypatch, tmp_path, capsys):
+    from assistant.experimental.conversation_eval import EvalCase
+
+    monkeypatch.setattr(native_eval, "CASES", (
+        EvalCase("pause", "Pause the music.", ("plan",), ("pause",)),
+    ))
+    calls = []
+    report = tmp_path / "failed-preflight.jsonl"
+
+    def fake_http(url, payload, _timeout):
+        calls.append((url, payload))
+        if payload is None:
+            return ({"version": "test"} if url.endswith("/api/version") else
+                    {"models": [{"name": "x", "digest": "digest"}]})
+        return {}
+
+    monkeypatch.setattr(native_eval, "_http_json", fake_http)
+    assert native_eval.main(["--url", "http://127.0.0.1:11434", "--model", "x",
+                             "--max-cases", "1", "--report", str(report)]) == 1
+    rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    case = next(row for row in rows if row.get("case_id") == "pause")
+    assert case["failure_category"] == "interpreter_failure"
+    assert case["request_sha256"]
+    preflight = case["request_timing"]["admission_preflight"]
+    assert preflight["attempts"] == 1
+    assert preflight["success"] is False
+    assert preflight["failure_category"] == "interpreter_failure"
+    assert case["request_timing"]["decision_transport"]["attempts"] == 0
+    assert rows[-1]["summary"] is True
+    assert capsys.readouterr().out
+    assert len(calls) == 3
+
+
+def test_timeout_stop_condition_stops_batch_and_streams_completed_report_rows(
+        monkeypatch, tmp_path, capsys):
+    from assistant.experimental.conversation_eval import EvalCase
+
+    monkeypatch.setattr(native_eval, "CASES", (
+        EvalCase("pause", "Pause the music.", ("plan",), ("pause",)),
+        EvalCase("resume", "Resume music.", ("plan",), ("resume",)),
+        EvalCase("next", "Skip to the next track.", ("plan",), ("next_track",)),
+    ))
+    calls = []
+    report = tmp_path / "partial.jsonl"
+    preflights = 0
+
+    def fake_http(url, payload, _timeout):
+        nonlocal preflights
+        calls.append((url, payload))
+        if payload is None:
+            return ({"version": "test"} if url.endswith("/api/version") else
+                    {"models": [{"name": "x", "digest": "digest"}]})
+        if payload["options"]["num_predict"] == 1:
+            preflights += 1
+            if preflights == 2:
+                written = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+                assert [row["case_id"] for row in written if "case_id" in row] == ["pause"]
+                time.sleep(0.55)
+            return {"prompt_eval_count": 10}
+        text = json.loads(payload["messages"][1]["content"])["transcript"]
+        name = "pause" if text.startswith("Pause") else "resume" if text.startswith("Resume") else "next_track"
+        return {"message": {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": name, "arguments": {}}}
+        ]}}
+
+    monkeypatch.setattr(native_eval, "_http_json", fake_http)
+    assert native_eval.main(["--url", "http://127.0.0.1:11434", "--model", "x",
+                             "--max-cases", "3", "--total-deadline", "5",
+                             "--per-case-deadline", "0.5", "--report", str(report)]) == 1
+    rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    case_rows = [row for row in rows if "case_id" in row]
+    assert len(case_rows) == 2
+    assert case_rows[1]["failure_category"] == "deadline_exceeded"
+    assert case_rows[1]["stop_condition"] == "interpreter_unavailable"
+    assert [row["case_id"] for row in case_rows] == ["pause", "resume"]
+    assert rows[-1]["summary"] is True
+    assert capsys.readouterr().out
+    assert len(calls) == 5
+
+
+def test_cli_refuses_existing_report_before_any_network(monkeypatch, tmp_path, capsys):
+    report = tmp_path / "existing.jsonl"
+    report.write_text("keep this\n", encoding="utf-8")
+
+    def should_not_run(**_kwargs):
+        raise AssertionError("network runner was called before report create")
+
+    monkeypatch.setattr(native_eval, "run_native_probe", should_not_run)
+    assert native_eval.main(["--model", "test", "--report", str(report)]) == 2
+    assert report.read_text(encoding="utf-8") == "keep this\n"
+    assert json.loads(capsys.readouterr().out) == {"error": "report_unavailable"}
+
+
+def test_cli_streams_metadata_cases_and_summary_to_report(monkeypatch, tmp_path, capsys):
+    report = tmp_path / "probe.jsonl"
+    case = {"case_id": "pause", "passed": True, "failure_category": None,
+            "kind": "plan", "capabilities": ["pause"], "latency_ms": 1.0,
+            "admission": None}
+    report_case = {**case, "request_sha256": "a" * 64,
+                   "request_timing": {"admission_preflight": {"attempts": 1},
+                                     "decision_transport": {"attempts": 1}},
+                   "stop_condition": None}
+
+    def fake_run(*, on_metadata, on_case, **_kwargs):
+        on_metadata({"ollama_version": "test", "model": "x", "model_digest": "d"})
+        on_case(report_case)
+        return {"ollama_version": "test", "model": "x", "model_digest": "d"}, [case]
+
+    monkeypatch.setattr(native_eval, "run_native_probe", fake_run)
+    assert native_eval.main(["--model", "x", "--report", str(report)]) == 0
+    rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    assert list(rows[0]) == ["metadata"]
+    assert rows[1]["failure_category"] is None
+    assert "request_timing" in rows[1]
+    assert rows[2]["summary"] is True
+    stdout_rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert set(stdout_rows[1]) == set(case)

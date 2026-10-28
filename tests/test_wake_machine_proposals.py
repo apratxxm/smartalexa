@@ -4,6 +4,8 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,7 +17,10 @@ from assistant.experimental.wake_train import machine_proposals as proposals
 
 class MachineProposalTests(unittest.TestCase):
     def test_default_import_does_not_load_model_dependencies(self):
-        self.assertNotIn("faster_whisper", __import__("sys").modules)
+        code = ("import sys; import assistant.experimental.wake_train.machine_proposals; "
+                "assert 'faster_whisper' not in sys.modules")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_exact_token_only_and_no_asr_based_negative(self):
         self.assertEqual(proposals.proposal_presence("Alexa, stop"), "positive")

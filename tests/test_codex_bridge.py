@@ -987,3 +987,73 @@ def test_non_windows_resolver_preserves_path_without_version_processes():
     def unexpected(*args, **kwargs):
         pytest.fail("Non-Windows path lookup must not run version processes")
     assert _resolve_codex_executable(platform="posix", which=lambda _: "/opt/codex", run=unexpected) == "/opt/codex"
+
+
+def test_deadline_expires_during_account_check_before_turn_dispatch(tmp_path, fake_server, monkeypatch):
+    from assistant.codex_bridge import DeadlineExpired
+    bridge = _bridge(tmp_path, fake_server)
+    try:
+        bridge.create_thread()
+        budget = [1]
+        original = bridge._check_account
+        def account(*, guard=None):
+            original(guard=guard)
+            budget[0] = -1
+        monkeypatch.setattr(bridge, "_check_account", account)
+        with pytest.raises(DeadlineExpired):
+            bridge.start_turn(THREAD_ID, "fix the login bug", guard=lambda: budget[0])
+        assert not any(row.get("method") == "turn/start" for row in fake_server.seen)
+        assert not bridge.mutation_uncertain
+    finally:
+        bridge.close()
+
+
+def test_thread_start_respects_guard_after_account_check(tmp_path, fake_server, monkeypatch):
+    from assistant.codex_bridge import DeadlineExpired
+    bridge = _bridge(tmp_path, fake_server)
+    try:
+        bridge.ensure_ready()
+        budget = [1]
+        original = bridge._check_account
+        def account(*, guard=None):
+            original(guard=guard)
+            budget[0] = 0
+        monkeypatch.setattr(bridge, "_check_account", account)
+        with pytest.raises(DeadlineExpired):
+            bridge.create_thread(guard=lambda: budget[0])
+        assert not any(row.get("method") == "thread/start" for row in fake_server.seen)
+    finally:
+        bridge.close()
+
+
+def test_adapter_expiry_after_confirmed_thread_creation_is_unknown(tmp_path, fake_server, monkeypatch):
+    from assistant.core.adapters.codex import CodexRequest
+
+    bridge = _bridge(tmp_path, fake_server)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('sandbox_mode = "workspace-write"')
+    now = [0]
+    original = bridge._check_account
+
+    def account(*, guard=None):
+        original(guard=guard)
+        if bridge.owned_threads:
+            now[0] = 2  # Sol's probe: account work outlives the t=1 deadline.
+
+    monkeypatch.setattr(bridge, "_check_account", account)
+    adapter = CodexRequest(
+        project_dir=tmp_path, config_path=config_path,
+        bridge_factory=lambda root: bridge,
+        raise_window=lambda guard: pytest.fail("expired turn must not focus Codex"),
+    )
+    try:
+        receipt = adapter.execute({"request": "fix the tests"}, lambda: 1 - now[0])
+        assert (receipt.state, receipt.detail) == ("unknown", "expired_after_creation")
+        methods = [row.get("method") for row in fake_server.seen]
+        assert methods.count("thread/start") == 1
+        assert methods.count("thread/name/set") == 1
+        assert "turn/start" not in methods
+        assert bridge.owned_threads == {THREAD_ID}
+        assert not bridge.mutation_uncertain
+    finally:
+        bridge.close()

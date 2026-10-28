@@ -147,13 +147,13 @@ def drive_spotify_search(backend, query: str, kind: str, *, timeout: float = 10.
 
 
 def drive_spotify_jam(backend, *, timeout: float = 12.0,
-                      clock=time.monotonic, sleep=time.sleep) -> str:
+                      clock=time.monotonic, sleep=time.sleep, deadline: float | None = None) -> str:
     """Drive a small, one-way state machine using snapshot/click backend methods.
 
     The backend must return visible named controls and must revalidate the target
     Spotify window and foreground before each click. Tests inject a fake backend.
     """
-    deadline = clock() + timeout
+    deadline = min(clock() + timeout, deadline) if deadline is not None else clock() + timeout
     acted: set[str] = set()
     while clock() < deadline:
         snapshot = backend.snapshot()
@@ -205,6 +205,8 @@ def drive_spotify_jam(backend, *, timeout: float = 12.0,
                     raise SpotifyJamError("Spotify's existing Jam control is disabled. Check the app.")
                 action = jam_buttons[0].name
                 if action not in acted:
+                    if clock() >= deadline:
+                        break
                     backend.click(action)
                     acted.add(action)
                     continue
@@ -230,6 +232,8 @@ def drive_spotify_jam(backend, *, timeout: float = 12.0,
                     action = connect[0].name
 
         if action is not None and action not in acted:
+            if clock() >= deadline:
+                break
             backend.click(action)
             acted.add(action)
             continue
@@ -261,7 +265,7 @@ class WindowsSpotifyBackend:
     _TOGGLE_PATTERN = 10015
     _VALUE_PATTERN = 10002
 
-    def __init__(self, *, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, *, clock=time.monotonic, sleep=time.sleep, deadline=None):
         if os.name != "nt":
             raise SpotifyJamError("Spotify desktop controls require Windows.")
         import ctypes
@@ -282,7 +286,7 @@ class WindowsSpotifyBackend:
         self.user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
         self.user32.SetCursorPos.restype = wintypes.BOOL
         self.user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
-        self.clock, self.sleep = clock, sleep
+        self.clock, self.sleep, self.deadline = clock, sleep, deadline
         self.hwnd = None
         self.pid = None
         self._activated = False
@@ -293,6 +297,10 @@ class WindowsSpotifyBackend:
             self.automation = CreateObject("UIAutomationClient.CUIAutomation", interface=IUIAutomation)
         except Exception as exc:
             raise SpotifyJamError("Windows UI Automation is unavailable. Open Spotify and try again.") from exc
+
+    def _check_deadline(self):
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise SpotifyJamError("The Jam deadline expired.")
 
     def _windows(self, pids: set[int]) -> list[tuple[int, int]]:
         c, w = self.ctypes, self.wintypes
@@ -320,6 +328,7 @@ class WindowsSpotifyBackend:
         pids = _spotify_pids()
         if not pids:
             try:
+                self._check_deadline()
                 open_external_target("spotify:")
             except OSError as exc:
                 raise SpotifyJamError("Spotify could not be opened through its registered app link.") from exc
@@ -339,7 +348,9 @@ class WindowsSpotifyBackend:
         c = self.ctypes
         if not self._activated:
             if self.user32.IsIconic(self.hwnd):
+                self._check_deadline()
                 self.user32.ShowWindow(self.hwnd, 9)  # SW_RESTORE
+            self._check_deadline()
             self.user32.SetForegroundWindow(self.hwnd)
         if int(self.user32.GetForegroundWindow() or 0) != self.hwnd:
             raise SpotifyJamError("Spotify focus changed or could not be acquired. No desktop control was activated.")
@@ -422,6 +433,7 @@ class WindowsSpotifyBackend:
             self._click_fresh_rectangle(name)
         else:
             try:
+                self._check_deadline()
                 getattr(typed_pattern, method_name)()
             except Exception as exc:
                 raise SpotifyJamError("Spotify's Jam control response is uncertain. Check the app before trying again; I won't repeat the click.") from exc
@@ -559,6 +571,7 @@ class WindowsSpotifyBackend:
         if right <= left or bottom <= top:
             raise SpotifyJamError("Spotify's Jam control has no safe visible click area.")
         self._focus()
+        self._check_deadline()
         if not self.user32.SetCursorPos((left + right) // 2, (top + bottom) // 2):
             raise SpotifyJamError("Spotify's Jam control could not be targeted safely.")
         self._focus()
@@ -588,13 +601,14 @@ class WindowsSpotifyBackend:
                 or not (current_left <= x < current_right and current_top <= y < current_bottom)):
             raise SpotifyJamError("Spotify's Jam control moved before the click. No input was sent.")
         self._focus()
+        self._check_deadline()
         self.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
         self.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
 
 
-def _run_native() -> dict[str, object]:
+def _run_native(deadline=None) -> dict[str, object]:
     try:
-        message = drive_spotify_jam(WindowsSpotifyBackend())
+        message = drive_spotify_jam(WindowsSpotifyBackend(deadline=deadline), deadline=deadline)
         return {"ok": True, "message": message}
     except SpotifyJamError as exc:
         return {"ok": False, "message": str(exc)}
@@ -617,6 +631,12 @@ def main() -> int:
     args = sys.argv[1:]
     if args == ["--run"]:
         payload = _run_native()
+    elif len(args) == 2 and args[0] == "--run" and args[1].startswith("--deadline="):
+        try:
+            deadline = float(args[1][len("--deadline="):])
+        except ValueError:
+            return 2
+        payload = _run_native(deadline)
     elif (len(args) == 4 and args[0] == "--search" and args[1] == "--kind"
           and args[3].startswith("--query=")):
         payload = _run_native_search(args[3][len("--query="):], args[2])

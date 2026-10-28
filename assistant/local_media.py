@@ -217,8 +217,16 @@ def play() -> bool:
 
 
 def next_track() -> bool:
-    before = title()
-    return _command("try_skip_next_async") and _wait_for(lambda: title() != before)
+    def build(before):
+        identity = _identity(before)
+        if not all(identity):
+            return None
+        return lambda after: all(_identity(after)) and _identity(after) != identity
+    try:
+        return _run(_verified_transport("try_skip_next_async", build), timeout=3.0)
+    except Exception as exc:
+        log.debug("Media next verification unavailable: %s", exc)
+        return False
 
 
 def previous_track() -> bool:

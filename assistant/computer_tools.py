@@ -236,12 +236,19 @@ def show_spotify(query: str, kind: str) -> str:
         timeout_message="Spotify did not verify desktop search results before the UI timed out. Check Spotify before trying again; the search may have been submitted.")
 
 
-def start_spotify_jam() -> str:
+def start_spotify_jam(*, deadline: float | None = None) -> str:
     """Show Spotify's Jam invitation UI and verify it in an isolated helper.
 
     The child process is deliberately time-limited because Windows UI Automation
     can block inside a third-party application's accessibility provider.
     """
+    if deadline is not None:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise ComputerControlError("The Jam deadline expired before dispatch.")
+        return _run_spotify_helper(
+            ["--run", "--deadline=" + repr(deadline)], timeout=timeout,
+            timeout_message="Spotify's Jam invite was not verified before the UI timed out. Check Spotify before trying again; a Jam may already have started.")
     return _run_spotify_helper(
         ["--run"],
         timeout_message="Spotify's Jam invite was not verified before the UI timed out. Check Spotify before trying again; a Jam may already have started.")

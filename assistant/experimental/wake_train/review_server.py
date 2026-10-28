@@ -8,6 +8,9 @@ come from request URLs or bodies; the server owns an opaque ID mapping.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import copy
 from datetime import datetime
 import hashlib
 import hmac
@@ -29,26 +32,58 @@ except ImportError:
 MAX_BODY_BYTES = 8192
 MAX_AUDIO_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 100
-REVIEW_MODES = {"possible_misses", "unconfirmed_hits", "all"}
-MODE_LABELS = {"possible_misses": "Short / quiet speech", "unconfirmed_hits": "Unconfirmed wake hits", "all": "All recordings"}
+REVIEW_MODES = {"reported_misses", "wake_evidence", "collection", "possible_misses", "unconfirmed_hits", "all"}
+MODE_LABELS = {"reported_misses": "Misses you marked (unverified)",
+               "wake_evidence": "Optional wake diagnostics (not confirmed)",
+               "collection": "Your explicitly collected recordings",
+               "possible_misses": "Short / quiet audio diagnostics",
+               "unconfirmed_hits": "Unconfirmed acoustic proposals",
+               "all": "All archived audio (advanced)"}
 DEFAULT_PORT = 8766
 DEFAULT_STORE = Path(__file__).parent / "human_reviews.json"
 
 
 def source_classification(candidate):
-    kind = str(candidate.get("candidate_kind", ""))
-    reason = str(candidate.get("reason", ""))
-    source = candidate.get("trigger_source", "")
+    kind_value = candidate.get("candidate_kind", "")
+    reason_value = candidate.get("reason", "")
+    source_value = candidate.get("trigger_source", "")
+    kind = kind_value if isinstance(kind_value, str) else ""
+    reason = reason_value if isinstance(reason_value, str) else ""
+    source = source_value if isinstance(source_value, str) else ""
+    if (candidate.get("audio_field") == "audio_path" and source == "wake_collection"
+            and kind == "intentional_wake"):
+        return "collection", "Explicitly collected wake recording; unknown until human review."
     diagnostic_kinds = {"no_trigger", "short_segment", "below_vad", "second_stt", "decode_error"}
-    if (candidate.get("audio_field") != "audio_path" or source in {"stt", "wake", "command", "retry"}
-            or (source not in {"near_miss", "wake_rejected", "miss", ""})
+    if (candidate.get("audio_field") != "audio_path"
+            or (source not in {"near_miss", "wake_rejected", "miss", "", "stt", "wake", "command", "retry"})
             or (not source and kind not in diagnostic_kinds)):
         return "all", "Other archived audio; not a verified wake recording."
+    if source in {"stt", "wake", "command", "retry"}:
+        # Accepted-source telemetry does not export the trigger evidence needed
+        # to distinguish a wake from ordinary command audio.
+        return "all", "Accepted audio has no exported wake evidence; it is not a verified wake recording."
+    if source == "miss":
+        return "reported_misses", "User-marked miss report; this is not independently verified ground truth."
     if kind == "acoustic_unconfirmed" or "acoustic_unconfirmed" in reason:
-        return "unconfirmed_hits", "The wake model proposed a hit, but wake confirmation rejected it. This is not proof that Alexa was spoken."
+        return "unconfirmed_hits", "An acoustic detector proposed a wake; this does not verify Alexa was spoken or missed."
     if kind in diagnostic_kinds or source in {"near_miss", "wake_rejected", "miss"}:
-        return "possible_misses", "Short / quiet speech; may include room noise, songs, or genuine missed wakes."
+        return "possible_misses", "Unverified short / quiet diagnostic audio; it may be ordinary room activity or a missed wake."
     return "all", "Other archived audio; not a verified wake recording."
+
+
+def _matches_mode(candidate, category, mode):
+    if mode == "reported_misses":
+        return candidate.get("audio_field") == "audio_path" and candidate.get("trigger_source") == "miss"
+    if mode == "collection":
+        return category == "collection"
+    if mode == "possible_misses":
+        return category == mode and candidate.get("trigger_source") != "miss"
+    if mode != "wake_evidence":
+        return category == mode
+    if category == "all":
+        return False
+    source = candidate.get("trigger_source", "")
+    return category in {"unconfirmed_hits", "collection"} or source == "miss"
 
 
 def _finite_seconds(value):
@@ -58,6 +93,41 @@ def _finite_seconds(value):
         return math.isfinite(float(value))
     except (OverflowError, ValueError):
         return False
+
+
+MAX_COLLECTION_REQUEST_BYTES = 180_000
+MAX_COLLECTION_WAV_BYTES = 132_096
+MAX_COLLECTION_BASE64_CHARS = ((MAX_COLLECTION_WAV_BYTES + 2) // 3) * 4
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def _collection_json(raw):
+    return json.loads(raw, object_pairs_hook=_unique_json_object,
+                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value")))
+
+
+def _default_collection_manager(state):
+    # Keep native/runtime and collection imports out of page loads and legacy review POSTs.
+    from assistant.config import Config, load
+    from assistant.telemetry import Telemetry
+    from .collection import CollectionManager
+
+    config_data = copy.deepcopy(load()._data)
+    config_data.setdefault("telemetry", {})["jsonl_path"] = str(state.telemetry)
+    config_data["telemetry"]["audio_dir"] = str(state.audio_root)
+    config_data["telemetry"]["text_log_path"] = str(state.telemetry.with_name("collection.log"))
+    config_data.setdefault("audio", {})["sample_rate"] = 16000
+    telemetry = Telemetry(Config(config_data))
+    lease_dir = state.project_root / "assistant" / "logs" / "collection_pauses"
+    return CollectionManager(telemetry, lease_dir)
 
 
 def recent_candidates(telemetry, audio_root, project_root, *, now=None, limit=MAX_CANDIDATES,
@@ -73,7 +143,7 @@ def recent_candidates(telemetry, audio_root, project_root, *, now=None, limit=MA
                                             min_ts=cutoff, max_ts=cutoff + 48 * 3600,
                                             resolve_audio_paths=False):
         category, _explanation = source_classification(candidate)
-        if mode != "all" and category != mode:
+        if mode != "all" and not _matches_mode(candidate, category, mode):
             continue
         if (candidate.get("event_id"), candidate.get("audio_field")) in excluded:
             continue
@@ -108,7 +178,7 @@ class ReviewState:
         self.nonce = secrets.token_urlsafe(32)
         self.lock = threading.RLock()
         self.played = {}
-        self.mode = "possible_misses"
+        self.mode = "reported_misses"
         self.candidates = {}
         self.pinned_id = None
         self._id_prefix = secrets.token_hex(8)
@@ -220,7 +290,7 @@ class ReviewState:
                 continue
             source_mode, source_explanation = source_classification(candidate)
             pinned_undo = opaque == pinned_id
-            if mode != "all" and source_mode != mode and not pinned_undo:
+            if mode != "all" and not _matches_mode(candidate, source_mode, mode) and not pinned_undo:
                 continue
             # Expose decision metadata, never archival filesystem paths or ASR prompts.
             wav_sha256 = ""
@@ -482,11 +552,160 @@ class ReviewState:
 
 PAGE = r"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Wake review</title><style>
-body{font:17px system-ui;background:#111827;color:#e5e7eb;max-width:720px;margin:32px auto;padding:0 20px}.card{background:#1f2937;border:1px solid #374151;border-radius:14px;padding:22px;margin-top:20px}button{font:inherit;padding:12px 18px;border-radius:8px;border:0;cursor:pointer;margin:8px 8px 8px 0;background:#dbeafe;color:#111827}button:disabled{opacity:.5;cursor:not-allowed}button:focus-visible{outline:3px solid #fbbf24;outline-offset:3px}button[aria-pressed="true"]{background:#14532d;color:#f0fdf4;border:2px solid #4ade80;box-shadow:0 0 0 2px #14532d;font-weight:700}.navigation{display:flex;align-items:center;gap:10px}.navigation button{margin:8px 0}.position{min-width:7em;text-align:center;color:#d1d5db}label{display:block;margin:14px 0}textarea{font:inherit;width:min(95%,600px);min-height:70px}audio{display:none}.status{min-height:1.5em}.error{color:#fca5a5}.small{color:#b9c4d5}
-</style><h1>Wake review</h1><p>These are unlabelled diagnostic recordings, not confirmed missed Alexas. Music and room noise are expected. Background labels help reduce false detections.</p><label for="mode">Review queue</label><select id="mode"><option value="possible_misses">Short / quiet speech</option><option value="unconfirmed_hits">Unconfirmed wake hits</option><option value="all">All recordings</option></select><button id="refresh" type="button">Refresh recordings</button><span id="refresh-status" class="small" role="status" aria-live="polite"></span><div id="summary" class="small" aria-live="polite"></div><button id="undo-review" type="button" hidden disabled>Undo last response</button><span id="undo-status" class="small" role="status" aria-live="polite"></span><p id="action-status" class="small" role="status" aria-live="polite"></p><main id="card"></main><script>
+body{font:17px system-ui;background:#111827;color:#e5e7eb;max-width:720px;margin:32px auto;padding:0 20px}.card{background:#1f2937;border:1px solid #374151;border-radius:14px;padding:22px;margin-top:20px}button{font:inherit;padding:12px 18px;border-radius:8px;border:0;cursor:pointer;margin:8px 8px 8px 0;background:#dbeafe;color:#111827}button:disabled{opacity:.5;cursor:not-allowed}button:focus-visible{outline:3px solid #fbbf24;outline-offset:3px}button[aria-pressed="true"]{background:#14532d;color:#f0fdf4;border:2px solid #4ade80;box-shadow:0 0 0 2px #14532d;font-weight:700}.navigation{display:flex;align-items:center;gap:10px}.navigation button{margin:8px 0}.position{min-width:7em;text-align:center;color:#d1d5db}label{display:block;margin:14px 0}textarea{font:inherit;width:min(95%,600px);min-height:70px}audio{display:none}.status{min-height:1.5em}.error{color:#fca5a5}.small{color:#b9c4d5}#card section.card>p:first-of-type{display:none}
+</style><h1>Voice reports</h1><p>After a miss or false wake, press Ctrl+Alt+M. Hear “Saved for review.”, then refresh.</p><button id="refresh" type="button">Refresh</button><span id="refresh-status" class="small" role="status" aria-live="polite"></span><main id="card"></main><p id="action-status" class="small" role="status" aria-live="polite"></p><details id="advanced" class="card"><summary>Advanced</summary><details id="source-metadata" hidden><summary>Recording details</summary><p id="source-metadata-text"></p></details><label for="mode">Review queue</label><select id="mode"><option value="reported_misses">Misses you marked</option><optgroup label="Optional detector diagnostics (not verified misses)"><option value="unconfirmed_hits">Unconfirmed acoustic proposals</option><option value="possible_misses">Short / quiet audio diagnostics</option><option value="all">All archived audio (advanced)</option></optgroup><optgroup label="Optional training recordings"><option value="collection">User-collected recordings</option></optgroup></select><div id="summary" class="small" aria-live="polite"></div><button id="undo-review" type="button" hidden disabled>Undo last response</button><span id="undo-status" class="small" role="status" aria-live="polite"></span><details aria-labelledby="collection-heading"><summary id="collection-heading">Optional training recording</summary><p>Create a session, choose Record Alexa (4 seconds), wait for “Recording now,” then say Alexa. Play saved clips before review. Collect training and holdout on separate occasions; another session click at the same sitting does not make an independent holdout.</p><label for="collection-condition">Recording condition</label><select id="collection-condition"><option value="quiet">Quiet</option><option value="music">Music</option><option value="noise">Noise</option></select><button id="collection-session" type="button">New recording session</button><button id="collection-record" type="button" disabled>Record Alexa (4 seconds)</button><p id="collection-status" class="small" role="status" aria-live="polite">No recording session.</p></details><details id="help"><summary>Help</summary><p>Ctrl+Alt+M saves recent audio after a missed wake or false wake. Ctrl+Alt+Space starts command listening; it does not save a prior report. A false-wake report is not a verified label.</p></details></details><script>
 const nonce=__NONCE__,el=(tag,text)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;return node;};let selectedId=null,selectedIndex=0;
+const collectionStatus=document.querySelector('#collection-status'),collectionSessionButton=document.querySelector('#collection-session'),collectionRecordButton=document.querySelector('#collection-record');
+let collectionSession=null,collectionAttempt=null,collectionSessionBusy=false,collectionGeneration=0;
+const collectionBusy=()=>collectionSessionBusy||collectionAttempt!==null;
+function syncCollectionButtons(){const busy=collectionBusy();collectionSessionButton.disabled=busy;collectionRecordButton.disabled=busy||!collectionSession;document.querySelector('#collection-condition').disabled=busy;}
+function setAttemptStatus(attempt,message){if(collectionAttempt===attempt&&!attempt.cancelled)collectionStatus.textContent=message;}
+async function collectionPost(path,body,{attempt=null,timeoutMs=5000}={}){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);
+ attempt?.controllers.add(controller);
+ try{
+  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Review-Nonce':nonce},body:JSON.stringify(body),cache:'no-store',signal:controller.signal});
+  let data;
+  try{data=await response.json();}catch{throw Error(response.ok?'Collection server response was invalid.':'Collection request failed.');}
+  if(!response.ok)throw Error(data&&typeof data==='object'&&!Array.isArray(data)?data.error||'Collection request failed.':'Collection request failed.');
+  if(!data||typeof data!=='object'||Array.isArray(data))throw Error('Collection server response was invalid.');
+  return data;
+ }finally{clearTimeout(timer);attempt?.controllers.delete(controller);}
+}
+function attemptDelay(attempt,milliseconds){
+ return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>{attempt.waiters.delete(cancel);resolve();},milliseconds);
+  const cancel=()=>{clearTimeout(timer);attempt.waiters.delete(cancel);reject(Error('Recording cancelled.'));};
+  attempt.waiters.add(cancel);
+ });
+}
+function stopAttemptCapture(attempt){
+ clearTimeout(attempt.timer);attempt.timer=null;
+ try{attempt.node?.port.postMessage('stop');}catch{}
+ if(attempt.stream)for(const track of attempt.stream.getTracks())track.stop();
+ try{attempt.node?.disconnect();attempt.source?.disconnect();attempt.silent?.disconnect();}catch{}
+ if(attempt.context){try{attempt.context.close().catch(()=>{});}catch{}attempt.context=null;}
+ attempt.stream=null;attempt.node=null;attempt.source=null;attempt.silent=null;
+}
+function bestEffortCancel(captureId){
+ if(!captureId)return;
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),1000);
+ fetch('/api/collection/cancel',{method:'POST',headers:{'Content-Type':'application/json','X-Review-Nonce':nonce},body:JSON.stringify({capture_id:captureId}),cache:'no-store',signal:controller.signal}).catch(()=>{}).finally(()=>clearTimeout(timer));
+}
+function abandonAttempt(attempt,message){
+ if(collectionAttempt!==attempt)return;
+ attempt.cancelled=true;attempt.controllers.forEach(controller=>controller.abort());
+ [...attempt.waiters].forEach(cancelWait=>cancelWait());
+ stopAttemptCapture(attempt);collectionAttempt=null;syncCollectionButtons();
+ if(attempt.captureId)bestEffortCancel(attempt.captureId);
+ collectionStatus.textContent=attempt.clipSubmissionStarted?'Save unconfirmed; refresh the collection queue to check whether this recording was saved.':message;
+}
+function releaseAttempt(attempt){
+ if(collectionAttempt!==attempt)return false;
+ attempt.cancelled=true;attempt.controllers.forEach(controller=>controller.abort());
+ stopAttemptCapture(attempt);collectionAttempt=null;syncCollectionButtons();return true;
+}
+collectionSessionButton.addEventListener('click',async()=>{
+ if(collectionBusy())return;collectionSessionBusy=true;syncCollectionButtons();collectionStatus.textContent='Creating an unlabelled recording session…';
+ try{collectionSession=await collectionPost('/api/collection/session',{condition:document.querySelector('#collection-condition').value});collectionStatus.textContent=`Session ${collectionSession.session_id} · ${collectionSession.condition} · ${collectionSession.split} split · up to ${collectionSession.max_clips} clips. All recordings remain unknown.`;}
+ catch(error){collectionStatus.textContent=error.message||'Could not create a collection session.';}
+ finally{collectionSessionBusy=false;syncCollectionButtons();}
+});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&collectionAttempt)abandonAttempt(collectionAttempt,'Recording cancelled because this tab was hidden.');});
+collectionRecordButton.addEventListener('click',async()=>{
+ if(!collectionSession||collectionBusy())return;
+ const attempt={generation:++collectionGeneration,sessionId:collectionSession.session_id,controllers:new Set(),waiters:new Set(),cancelled:false,
+  captureId:null,stream:null,context:null,source:null,node:null,silent:null,timer:null,chunks:[],sampleCount:0,finished:false};
+ collectionAttempt=attempt;syncCollectionButtons();collectionStatus.textContent='Requesting microphone access…';
+ try{
+  if(!navigator.mediaDevices?.getUserMedia||!window.AudioContext||!window.AudioWorkletNode)
+   throw Error('This browser does not support explicit microphone recording with AudioWorklet.');
+  const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  if(collectionAttempt!==attempt||attempt.cancelled){for(const track of stream.getTracks())track.stop();return;}
+  attempt.stream=stream;
+  const microphoneLabel=stream.getAudioTracks()[0]?.label||'selected microphone';
+  setAttemptStatus(attempt,`Microphone: ${microphoneLabel}. Preparing the recorder…`);
+  const context=new AudioContext({sampleRate:16000});attempt.context=context;
+  if(context.sampleRate!==16000)throw Error(`Microphone audio rate is ${context.sampleRate} Hz; this recorder requires exactly 16000 Hz.`);
+  await context.resume();
+  if(collectionAttempt!==attempt||attempt.cancelled)return;
+  if(context.state!=='running')throw Error('The browser audio context did not enter the running state.');
+  const processorSource=`class CaptureProcessor extends AudioWorkletProcessor{constructor(){super();this.recording=false;this.samples=0;this.port.onmessage=e=>{this.recording=e.data==='start';if(this.recording)this.samples=0;};}process(inputs){const input=inputs[0]&&inputs[0][0];if(this.recording&&input){const count=Math.min(input.length,64000-this.samples);if(count>0){this.port.postMessage(input.subarray(0,count).slice());this.samples+=count;}if(this.samples>=64000)this.recording=false;}return true;}}registerProcessor('explicit-capture',CaptureProcessor);`;
+  const moduleUrl=URL.createObjectURL(new Blob([processorSource],{type:'text/javascript'}));
+  try{await context.audioWorklet.addModule(moduleUrl);}finally{URL.revokeObjectURL(moduleUrl);}
+  if(collectionAttempt!==attempt||attempt.cancelled)return;
+  if(context.state!=='running')throw Error('The browser audio context is not running; no recording was made.');
+  const source=context.createMediaStreamSource(stream),node=new AudioWorkletNode(context,'explicit-capture'),silent=context.createGain();
+  silent.gain.value=0;source.connect(node);node.connect(silent);silent.connect(context.destination);
+  attempt.source=source;attempt.node=node;attempt.silent=silent;
+  const armed=await collectionPost('/api/collection/arm',{session_id:attempt.sessionId},{attempt});
+  if(collectionAttempt!==attempt||attempt.cancelled){bestEffortCancel(armed.capture_id);return;}
+  attempt.captureId=armed.capture_id;
+  if(context.state!=='running')throw Error('The browser audio context is not running; no recording was made.');
+  setAttemptStatus(attempt,'Waiting for the assistant to acknowledge the brief recording pause…');
+  const readyDeadline=Date.now()+5000;let acknowledged=false;
+  while(Date.now()<readyDeadline){
+   if(collectionAttempt!==attempt||attempt.cancelled)return;
+   const ready=await collectionPost('/api/collection/ready',{capture_id:attempt.captureId},{attempt});
+   if(collectionAttempt!==attempt||attempt.cancelled)return;
+   if(Date.now()>readyDeadline)break;
+   if(ready.ready){acknowledged=true;break;}
+   if(ready.expired)throw Error('The recording pause expired. Start a new recording attempt.');
+   const remaining=readyDeadline-Date.now();if(remaining>0)await attemptDelay(attempt,Math.min(250,remaining));
+  }
+  if(!acknowledged)throw Error('The assistant did not acknowledge the recording pause within five seconds.');
+  if(context.state!=='running')throw Error('The browser audio context stopped before capture; no recording was made.');
+  setAttemptStatus(attempt,'Recording now. Speak “Alexa” clearly; no sound cue will play.');
+  node.port.onmessage=event=>{
+   if(collectionAttempt!==attempt||attempt.finished||attempt.sampleCount>=64000)return;
+   const remaining=64000-attempt.sampleCount,chunk=event.data.subarray(0,remaining);
+   attempt.chunks.push(chunk);attempt.sampleCount+=chunk.length;
+   if(attempt.sampleCount>=64000)void finishCollectionCapture(attempt);
+  };
+  node.port.postMessage('start');
+  attempt.timer=setTimeout(()=>void finishCollectionCapture(attempt),4200);
+ }catch(error){
+  if(collectionAttempt!==attempt)return;
+  if(attempt.captureId)bestEffortCancel(attempt.captureId);
+  setAttemptStatus(attempt,error.message||'Microphone setup or recording failed.');
+  releaseAttempt(attempt);
+ }
+});
+async function finishCollectionCapture(attempt){
+ if(collectionAttempt!==attempt||attempt.finished)return;
+ attempt.finished=true;
+ stopAttemptCapture(attempt); // Stop the microphone before encoding or any network wait.
+ if(attempt.sampleCount<4000){
+  if(attempt.captureId)bestEffortCancel(attempt.captureId);
+  setAttemptStatus(attempt,'Too little microphone audio was captured; no clip was saved.');
+  releaseAttempt(attempt);return;
+ }
+ try{
+  const pcm=new Int16Array(attempt.sampleCount);let offset=0;
+  for(const chunk of attempt.chunks){for(let i=0;i<chunk.length&&offset<attempt.sampleCount;i++){const value=Math.max(-1,Math.min(1,chunk[i]));pcm[offset++]=value<0?Math.round(value*32768):Math.round(value*32767);}if(offset>=attempt.sampleCount)break;}
+  const bytes=new ArrayBuffer(44+pcm.length*2),view=new DataView(bytes);
+  const put=(at,text)=>{for(let i=0;i<text.length;i++)view.setUint8(at+i,text.charCodeAt(i));};
+  put(0,'RIFF');view.setUint32(4,bytes.byteLength-8,true);put(8,'WAVE');put(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,16000,true);view.setUint32(28,32000,true);view.setUint16(32,2,true);view.setUint16(34,16,true);put(36,'data');view.setUint32(40,pcm.length*2,true);
+  for(let i=0;i<pcm.length;i++)view.setInt16(44+i*2,pcm[i],true);
+  let binary='';for(let i=0;i<bytes.byteLength;i+=0x8000)binary+=String.fromCharCode(...new Uint8Array(bytes,i,Math.min(0x8000,bytes.byteLength-i)));
+  attempt.clipSubmissionStarted=true;
+  const result=await collectionPost('/api/collection/clip',{capture_id:attempt.captureId,wav_base64:btoa(binary)},{attempt,timeoutMs:15000});
+  if(collectionAttempt!==attempt||attempt.cancelled)return;
+  if(result.saved!==true||result.indexed!==true||result.review_state!=='unknown'
+     ||result.session_id!==attempt.sessionId||typeof result.event_id!=='string'||!result.event_id.trim()
+     ||!['train','holdout'].includes(result.split))throw Error('Collection save receipt was invalid.');
+  setAttemptStatus(attempt,`Saved unlabelled recording ${result.event_id} · ${result.split} split · still unknown. It is available for human review.`);
+  document.querySelector('#mode').value='collection';
+  releaseAttempt(attempt);void load();
+ }catch(error){
+  if(collectionAttempt!==attempt)return;
+  if(attempt.captureId)bestEffortCancel(attempt.captureId);
+  setAttemptStatus(attempt,attempt.clipSubmissionStarted?'Save unconfirmed; refresh the collection queue to check whether this recording was saved.':error.message||'Recording upload failed.');
+  releaseAttempt(attempt);
+ }
+}
 document.querySelector('#mode').addEventListener('change',async event=>{try{const response=await fetch(`/api/state?refresh=1&mode=${encodeURIComponent(event.target.value)}`,{cache:'no-store'});if(!response.ok)throw Error();selectedId=null;selectedIndex=0;await load();}catch{document.querySelector('#refresh-status').textContent=' Queue change failed.';}});document.querySelector('#refresh').addEventListener('click',async()=>{const button=document.querySelector('#refresh'),status=document.querySelector('#refresh-status');button.disabled=true;status.textContent=' Refreshing…';try{const response=await fetch('/api/state?refresh=1',{cache:'no-store'});if(!response.ok)throw Error();await load();status.textContent=' Recordings refreshed.';}catch{status.textContent=' Refresh failed; the current card is unchanged.';}finally{button.disabled=false;}});
-async function load(){const root=document.querySelector('#card');try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error('state unavailable');const s=await response.json(),candidates=Array.isArray(s.candidates)?s.candidates:[],reviewable=candidates.filter(c=>c&&c.available&&typeof c.session_seed==='string'&&c.session_seed.trim()),unavailable=candidates.filter(c=>!c||!c.available).length,ungrouped=candidates.length-reviewable.length-unavailable,skipped=unavailable+ungrouped;document.querySelector('#summary').textContent=`${reviewable.length} reviewable recordings · ${unavailable} unavailable and ${ungrouped} missing trusted session skipped · ${s.reviewed_counts.positive} span-ready positives · ${s.reviewed_counts.negative} negatives · ${s.reviewed_counts.unsure} presence-only or unsure. Training has not started.`;const undo=document.querySelector('#undo-review');undo.hidden=!s.latest_review;undo.disabled=!s.latest_review;undo.dataset.token=s.latest_review?s.latest_review.undo_token:'';undo.textContent=s.latest_review?`Undo last response (${s.latest_review.presence==='negative'?'Not Alexa':'Alexa'})`:'Undo last response';root.replaceChildren();if(!reviewable.length){selectedId=null;selectedIndex=0;root.append(el('p',skipped?`No recordings can be reviewed right now. ${unavailable} unavailable and ${ungrouped} missing trusted session recordings were skipped. Use Refresh recordings to check again.`:'No recordings are waiting. Use Refresh recordings to check again.'));return;}let index=selectedId?reviewable.findIndex(row=>row.id===selectedId):-1;if(index<0)index=Math.min(selectedIndex,reviewable.length-1);selectedIndex=index;const c=reviewable[index];selectedId=c.id;const box=el('section');box.className='card';root.append(box);const nav=el('nav');nav.className='navigation';nav.setAttribute('aria-label','Review navigation');const previous=el('button','Previous review');previous.type='button';previous.disabled=index===0;previous.addEventListener('click',()=>{selectedIndex=index-1;selectedId=reviewable[index-1].id;load();});const position=el('span',`Review ${index+1} of ${reviewable.length}`);position.className='position';position.setAttribute('aria-live','polite');const next=el('button','Next review');next.type='button';next.disabled=index===reviewable.length-1;next.addEventListener('click',()=>{selectedIndex=index+1;selectedId=reviewable[index+1].id;load();});nav.append(previous,position,next);box.append(nav);box.append(el('h2',new Date(c.ts*1000).toLocaleString()));box.append(el('p',c.reason));
+async function load(){const root=document.querySelector('#card');try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error('state unavailable');const s=await response.json(),candidates=Array.isArray(s.candidates)?s.candidates:[],reviewable=candidates.filter(c=>c&&c.available&&typeof c.session_seed==='string'&&c.session_seed.trim()),unavailable=candidates.filter(c=>!c||!c.available).length,ungrouped=candidates.length-reviewable.length-unavailable,skipped=unavailable+ungrouped;document.querySelector('#summary').textContent=`${reviewable.length} reviewable recordings · ${unavailable} unavailable and ${ungrouped} missing trusted session skipped · ${s.reviewed_counts.positive} span-ready positives · ${s.reviewed_counts.negative} negatives · ${s.reviewed_counts.unsure} presence-only or unsure. Training has not started.`;const undo=document.querySelector('#undo-review');undo.hidden=!s.latest_review;undo.disabled=!s.latest_review;undo.dataset.token=s.latest_review?s.latest_review.undo_token:'';undo.textContent=s.latest_review?`Undo last response (${s.latest_review.presence==='negative'?'Not Alexa':'Alexa'})`:'Undo last response';root.replaceChildren();if(!reviewable.length){selectedId=null;selectedIndex=0;const emptyMessage=skipped?`No recordings can be reviewed right now. ${unavailable} unavailable and ${ungrouped} missing trusted session recordings were skipped. Use Refresh recordings to check again.`:s.mode==='reported_misses'?'No saved reports yet.':s.mode==='collection'?'No user-collected recordings are waiting. Expand Optional training recording to create a session.':'No optional diagnostic recordings are waiting. Use Refresh recordings to check again.';root.append(el('p',emptyMessage));return;}let index=selectedId?reviewable.findIndex(row=>row.id===selectedId):-1;if(index<0)index=Math.min(selectedIndex,reviewable.length-1);selectedIndex=index;const c=reviewable[index];selectedId=c.id;const box=el('section');box.className='card';root.append(box);const nav=el('nav');nav.className='navigation';nav.setAttribute('aria-label','Review navigation');const previous=el('button','Previous review');previous.type='button';previous.disabled=index===0;previous.addEventListener('click',()=>{selectedIndex=index-1;selectedId=reviewable[index-1].id;load();});const position=el('span',`Review ${index+1} of ${reviewable.length}`);position.className='position';position.setAttribute('aria-live','polite');const next=el('button','Next review');next.type='button';next.disabled=index===reviewable.length-1;next.addEventListener('click',()=>{selectedIndex=index+1;selectedId=reviewable[index+1].id;load();});nav.append(previous,position,next);box.append(nav);box.append(el('h2',new Date(c.ts*1000).toLocaleString()));box.append(el('p',c.reason));
 const audio=el('audio');audio.preload='none';audio.src='/audio/'+c.id;box.append(audio);let played=false,finished=false,negativeButton=null;audio.addEventListener('play',()=>{played=true;});const play=el('button','Play');play.type='button';play.addEventListener('click',()=>{if(audio.paused){audio.play().catch(()=>{status.className='status error';status.textContent='Playback failed. Try again or use Refresh recordings.';play.textContent='Play';});play.textContent='Pause';}else audio.pause();});audio.addEventListener('pause',()=>{play.textContent='Play';});box.append(play);
 const status=el('p');status.className='status';status.setAttribute('role','status');box.append(status);const completePlaybackCoverage=()=>{const duration=audio.duration,ranges=audio.played,tolerance=Math.min(0.08,Math.max(0.03,duration*0.005));if(!ranges||ranges.length===0)return false;let covered=0;for(let i=0;i<ranges.length;i++){const start=ranges.start(i),end=ranges.end(i);if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<start||start>covered+tolerance)return false;covered=Math.max(covered,end);}return ranges.start(0)<=tolerance&&covered>=duration-tolerance;};const maybeUnlock=()=>{const duration=audio.duration;if(!finished&&played&&!audio.seeking&&Number.isFinite(duration)&&duration>0&&Number.isFinite(audio.currentTime)&&audio.currentTime>=duration-0.15&&completePlaybackCoverage()){finished=true;if(negativeButton)negativeButton.disabled=false;status.textContent='Full recording heard. Not Alexa is now available.';play.textContent='Play';}};audio.addEventListener('timeupdate',maybeUnlock);audio.addEventListener('ended',maybeUnlock);audio.addEventListener('error',()=>{status.className='status error';status.textContent='Recording playback failed. Refresh recordings and try another review.';play.textContent='Play';});
 box.append(el('p','Listen through once to enable Not Alexa.'));box.append(el('p','For Not Alexa, choose a source if one fits. Otherwise describe the other sound.'));
@@ -508,6 +727,9 @@ load=async function(){
  await loadCandidates();
  try{
   const state=cachedReviewState||{},readiness=state.readiness||{},reasons=Array.isArray(readiness.blocked_reasons)?readiness.blocked_reasons:[];
+  if(typeof state.mode==='string')document.querySelector('#mode').value=state.mode;
+  const currentRow=(state.candidates||[]).find(row=>row.id===selectedId),sourceDetails=document.querySelector('#source-metadata');
+  document.querySelector('#source-metadata-text').textContent=currentRow?currentRow.reason:'';sourceDetails.hidden=!currentRow;
   const missingPositive=reasons.filter(reason=>/^missing (train|holdout) positive session groups$/.test(reason));
   const missingSides=missingPositive.map(reason=>reason.startsWith('missing train')?'train':'holdout').join(' and ');
   const prompt=missingPositive.length?`Collect clearly heard Alexa spans from independent sessions that include quiet speech and music/noise; ${missingSides} positive groups are missing. `:'';
@@ -648,7 +870,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if url.fragment or url.scheme or url.netloc:
             self._respond(400, {"error": "Query parameters are not accepted"})
             return
-        if url.path == "/":
+        if url.path == "/health":
+            if url.query:
+                self._respond(400, {"error": "Query parameters are not accepted"})
+                return
+            self._respond(200, {"service": "smartalexa-wake-review", "version": 1})
+        elif url.path == "/":
             if url.query:
                 self._respond(400, {"error": "Query parameters are not accepted"})
                 return
@@ -701,7 +928,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 or not valid_nonce or self.headers.get("Sec-Fetch-Site") == "cross-site"):
             self._respond(403, {"error": "Local Origin, Host and review nonce required"})
             return
-        if self.path not in ("/api/label", "/api/retract") or self.headers.get("Transfer-Encoding"):
+        review_paths = ("/api/label", "/api/retract")
+        collection_fields = {
+            "/api/collection/session": {"condition"},
+            "/api/collection/arm": {"session_id"},
+            "/api/collection/ready": {"capture_id"},
+            "/api/collection/clip": {"capture_id", "wav_base64"},
+            "/api/collection/cancel": {"capture_id"},
+        }
+        if (self.path not in review_paths and self.path not in collection_fields) or self.headers.get("Transfer-Encoding"):
             self._respond(400, {"error": "Unsupported review request"})
             return
         try:
@@ -710,20 +945,82 @@ class ReviewHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             length = 0
-        if not 0 < length <= MAX_BODY_BYTES:
-            self._respond(413, {"error": "Review request size rejected"})
+        body_limit = MAX_COLLECTION_REQUEST_BYTES if self.path == "/api/collection/clip" else MAX_BODY_BYTES
+        if not 0 < length <= body_limit:
+            message = "Collection request size rejected" if self.path in collection_fields else "Review request size rejected"
+            self._respond(413, {"error": message})
             return
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
-            self._respond(415, {"error": "JSON review required"})
+            label = "Collection" if self.path in collection_fields else "Review"
+            self._respond(415, {"error": f"JSON {label.lower()} request required"})
             return
         try:
-            body = json.loads(self.rfile.read(length), parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value")))
+            raw = self.rfile.read(length)
+            body = _collection_json(raw) if self.path in collection_fields else json.loads(
+                raw, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Non-finite JSON value")))
+            if self.path in collection_fields:
+                if not isinstance(body, dict) or set(body) != collection_fields[self.path]:
+                    raise ValueError("Unsupported collection fields")
+                if self.path == "/api/collection/session":
+                    condition = body["condition"]
+                    if not isinstance(condition, str) or condition not in {"quiet", "music", "noise"}:
+                        raise ValueError("Invalid collection condition")
+                else:
+                    token_field = "session_id" if self.path == "/api/collection/arm" else "capture_id"
+                    token = body[token_field]
+                    if (not isinstance(token, str) or len(token) != 32
+                            or any(char not in "0123456789abcdef" for char in token)):
+                        raise ValueError("Invalid collection token")
+                if self.path == "/api/collection/clip":
+                    encoded = body["wav_base64"]
+                    if (not isinstance(encoded, str) or not encoded
+                            or len(encoded) > MAX_COLLECTION_BASE64_CHARS or not encoded.isascii()):
+                        raise ValueError("Invalid collection WAV encoding")
+                manager = self.server.collection_manager
+                if manager is None:
+                    with self.server.collection_manager_lock:
+                        manager = self.server.collection_manager
+                        if manager is None:
+                            manager = self.server.collection_manager_factory(self.server.review_state)
+                            self.server.collection_manager = manager
+                if self.path == "/api/collection/session":
+                    condition = body["condition"]
+                    result = manager.create_session(condition)
+                elif self.path == "/api/collection/arm":
+                    session_id = body["session_id"]
+                    result = manager.arm(session_id)
+                elif self.path == "/api/collection/ready":
+                    capture_id = body["capture_id"]
+                    result = manager.ready(capture_id)
+                elif self.path == "/api/collection/cancel":
+                    capture_id = body["capture_id"]
+                    result = manager.cancel(capture_id)
+                else:
+                    capture_id, encoded = body["capture_id"], body["wav_base64"]
+                    try:
+                        wav_bytes = base64.b64decode(encoded, validate=True)
+                    except (binascii.Error, ValueError) as exc:
+                        raise ValueError("Invalid collection WAV encoding") from exc
+                    if len(wav_bytes) > MAX_COLLECTION_WAV_BYTES:
+                        raise ValueError("Collection WAV exceeds the size limit")
+                    result = manager.submit(capture_id, wav_bytes)
+                    self.server.review_state.refresh("collection")
+                self._respond(200, result)
+                return
             if self.path == "/api/retract":
                 self._respond(200, self.server.review_state.retract(body))
             else:
                 self._respond(200, self.server.review_state.label(body))
         except (OSError, ValueError, TypeError) as exc:
-            self._respond(400, {"error": self._safe_review_error(exc)})
+            if self.path in collection_fields:
+                self._respond(400, {"error": str(exc) if isinstance(exc, ValueError) else "Collection request failed."})
+            else:
+                self._respond(400, {"error": self._safe_review_error(exc)})
+        except RuntimeError as exc:
+            if self.path in collection_fields:
+                self._respond(409, {"error": str(exc) if str(exc) and not any(sep in str(exc) for sep in ("\\", "/")) else "Collection request could not be completed."})
+            else:
+                self._respond(400, {"error": self._safe_review_error(exc)})
 
 
 class ExclusiveLoopbackServer(ThreadingHTTPServer):
@@ -739,16 +1036,19 @@ class ExclusiveLoopbackServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def create_server(state, port=DEFAULT_PORT):
+def create_server(state, port=DEFAULT_PORT, *, collection_manager_factory=None, strict_port=False):
     port = int(port)
     if not 0 <= port <= 65535:
         raise ValueError("Invalid loopback port")
-    choices = [port] if port == 0 else range(port, min(port + 10, 65536))
+    choices = [port] if strict_port or port == 0 else range(port, min(port + 10, 65536))
     last_error = None
     for candidate in choices:
         try:
             server = ExclusiveLoopbackServer(("127.0.0.1", candidate), ReviewHandler)
             server.review_state = state
+            server.collection_manager = None
+            server.collection_manager_factory = collection_manager_factory or _default_collection_manager
+            server.collection_manager_lock = threading.Lock()
             server.daemon_threads = True
             return server
         except OSError as exc:
@@ -763,9 +1063,11 @@ def main(argv=None):
     parser.add_argument("--project-root", default=str(review.PROJECT_ROOT))
     parser.add_argument("--store", default=str(DEFAULT_STORE))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--strict-port", action="store_true",
+                        help="fail if --port is occupied instead of trying later loopback ports")
     args = parser.parse_args(argv)
     state = ReviewState(args.telemetry, args.audio_root, args.project_root, args.store)
-    server = create_server(state, args.port)
+    server = create_server(state, args.port, strict_port=args.strict_port)
     print(f"Listening review: http://127.0.0.1:{server.server_port} (training has not started)", flush=True)
     try:
         server.serve_forever()

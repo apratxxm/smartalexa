@@ -37,6 +37,64 @@ def test_flush_discards_filter_and_output_history():
     assert raw.size == 512 and not np.any(raw) and clean is None
 
 
+def test_diagnostic_history_survives_stalled_consumer_flush_and_discard():
+    mic = Microphone()
+    data = np.arange(16000, dtype=np.int16).reshape(-1, 1)
+    mic._callback(data, len(data), None, None)
+    assert len(mic._queue) == 1  # consumer has not called read()
+    live_resampler = mic._resampler
+    mic.flush()
+    assert not mic._queue and not mic._ring
+    assert mic._resampler is live_resampler
+    np.testing.assert_array_equal(mic.recent_diagnostic_audio(), data[:, 0])
+
+    with mic.discard_capture():
+        mic._callback(np.full((8000, 1), 23, dtype=np.int16), 8000, None, None)
+    assert not mic._queue
+    recent = mic.recent_diagnostic_audio()
+    np.testing.assert_array_equal(recent[-8000:], np.full(8000, 23, dtype=np.int16))
+    assert mic._diagnostic_samples <= mic._diagnostic_sample_limit
+
+
+def test_diagnostic_history_is_sample_bounded_and_discards_stale_chunks(monkeypatch):
+    import assistant.audio as audio_module
+    mic = Microphone()
+    perf_now = [100.0]
+    monkeypatch.setattr(audio_module.time, "perf_counter", lambda: perf_now[0])
+    oversized = np.arange(31 * 16000, dtype=np.int32).astype(np.int16).reshape(-1, 1)
+    mic._callback(oversized, len(oversized), None, None)
+    assert mic._diagnostic_samples == 30 * 16000
+    np.testing.assert_array_equal(mic.recent_diagnostic_audio(), oversized[-30 * 16000:, 0])
+
+    perf_now[0] = 140.0
+    mic._callback(np.ones((16000, 1), dtype=np.int16), 16000, None, None)
+    assert mic._diagnostic_samples == 16000
+    np.testing.assert_array_equal(mic.recent_diagnostic_audio(), np.ones(16000, dtype=np.int16))
+
+
+def test_diagnostic_snapshot_resamples_native_48khz_without_touching_live_state():
+    mic = Microphone(capture_rate=48000)
+    native = (12000 * np.sin(np.arange(48000) * 0.137)).astype(np.int16)
+    mic._callback(native.reshape(-1, 1), len(native), None, None)
+    resampler = mic._resampler
+    live_queue = list(mic._queue)
+    output_pending = mic._output_pending.copy()
+    expected = soxr.resample(native.astype(np.float32), 48000, 16000)
+    actual = mic.recent_diagnostic_audio()
+    np.testing.assert_array_equal(actual, np.clip(expected, -32768, 32767).astype(np.int16))
+    assert mic._resampler is resampler
+    assert len(mic._queue) == len(live_queue)
+    np.testing.assert_array_equal(mic._output_pending, output_pending)
+
+
+def test_diagnostic_history_clears_when_device_exits():
+    mic = Microphone()
+    mic._callback(np.ones((512, 1), dtype=np.int16), 512, None, None)
+    assert mic.recent_diagnostic_audio().size == 512
+    mic.__exit__()
+    assert mic.recent_diagnostic_audio().size == 0
+
+
 def test_preroll_pair_copies_clean_output_and_keeps_matching_offsets():
     mic = Microphone(frame_length=4, sample_rate=4, ring_seconds=2)
     reusable = np.zeros(4, dtype=np.int16)
@@ -86,6 +144,285 @@ def test_read_without_echo_records_unavailable_processed_frame():
     mic.read()
     raw, clean = mic.preroll_pair(1)
     assert raw.size == 512 and clean is None
+
+
+def test_diagnostic_pair_retains_read_owned_pairs_and_respects_end_time(monkeypatch):
+    import assistant.audio as audio_module
+    mic = Microphone()
+    class Echo:
+        active = True
+        def process(self, frame, _timestamp):
+            return frame.astype(np.int16) + 100
+    mic.echo = Echo()
+    done = iter([10.1, 10.2, 10.3])
+    monkeypatch.setattr(audio_module.time, "perf_counter", lambda: next(done))
+    for i, stamp in enumerate((9.8, 9.9, 10.0)):
+        mic._queue.append((stamp, np.full(512, i + 1, dtype=np.int16)))
+        mic.read()
+    pair = mic.recent_diagnostic_pair(end_time=10.25)
+    assert pair.coverage["read_start"] == 0
+    assert pair.coverage["read_end_exclusive"] == 2
+    assert pair.coverage["pairing"] == "read_invocation"
+    assert pair.coverage["capture_continuity"] == "unverified"
+    np.testing.assert_array_equal(pair.raw, np.array([1] * 512 + [2] * 512, dtype=np.int16))
+    np.testing.assert_array_equal(pair.processed, pair.raw + 100)
+    pair.raw[:] = -1
+    assert mic.recent_diagnostic_pair(end_time=10.25).raw[0] == 1
+
+
+def test_diagnostic_pair_flush_marks_break_but_keeps_tail(monkeypatch):
+    import assistant.audio as audio_module
+    mic = Microphone()
+    class Echo:
+        active = True
+        def process(self, frame, _timestamp): return frame.copy()
+    mic.echo = Echo()
+    monkeypatch.setattr(audio_module.time, "perf_counter", lambda: 10.0)
+    mic._queue.append((9.9, np.ones(512, dtype=np.int16)))
+    mic.read()
+    mic.flush()
+    snap = mic.recent_diagnostic_pair(end_time=10.1)
+    assert snap.raw.size == 512 and snap.processed.size == 512
+    assert snap.coverage["status"] == "partial"
+    assert "flush_after_tail" in snap.coverage["break_reasons"]
+
+
+def test_diagnostic_pair_latest_inactive_echo_fails_closed():
+    mic = Microphone()
+    class Echo:
+        active = False
+        def process(self, frame, _timestamp): return frame.copy()
+    mic.echo = Echo()
+    mic._queue.append((1.0, np.ones(512, dtype=np.int16)))
+    mic.read()
+    snap = mic.recent_diagnostic_pair()
+    assert snap.coverage["status"] == "missing"
+    assert snap.processed is None and snap.raw.size == 0
+    assert "inactive_or_invalid_clean" in snap.coverage["break_reasons"]
+
+
+@pytest.mark.parametrize("field,code", [
+    ("queue_overflow_count", "callback_overflow"),
+    ("_callback_status_count", "callback_status"),
+    ("intentional_discard_count", "intentional_discard"),
+])
+def test_diagnostic_pair_marks_capture_discontinuity_counters(field, code, monkeypatch):
+    import assistant.audio as audio_module
+    mic = Microphone()
+    class Echo:
+        active = True
+        def process(self, frame, _timestamp): return frame.copy()
+    mic.echo = Echo()
+    ticks = iter([20.0, 20.1])
+    monkeypatch.setattr(audio_module.time, "perf_counter", lambda: next(ticks))
+    mic._queue.append((10.0, np.ones(512, dtype=np.int16)))
+    mic.read()
+    setattr(mic, field, getattr(mic, field) + 1)
+    mic._queue.append((10.1, np.full(512, 2, dtype=np.int16)))
+    mic.read()
+    snap = mic.recent_diagnostic_pair(end_time=20.2)
+    assert code in snap.coverage["break_reasons"]
+    assert snap.raw.size == 512
+
+
+def test_diagnostic_pair_read_history_is_independent_of_later_callback_data():
+    mic = Microphone()
+    class Echo:
+        active = True
+        def process(self, frame, _timestamp): return frame.copy()
+    mic.echo = Echo()
+    mic._queue.append((10.0, np.ones(512, dtype=np.int16)))
+    mic.read()
+    mic._callback(np.full((512, 1), 9, dtype=np.int16), 512, None, None)
+    snap = mic.recent_diagnostic_pair()
+    assert snap.raw.size == 512
+    np.testing.assert_array_equal(snap.raw, np.ones(512, dtype=np.int16))
+
+
+def test_diagnostic_pair_uses_whole_records_under_sample_and_count_bounds():
+    mic = Microphone()
+    frame = np.ones(1000, dtype=np.int16)
+    for i in range(481):
+        mic._append_diagnostic_pair(frame, frame, 100.0 + i / 1000, 50.0 + i / 1000)
+    snap = mic.recent_diagnostic_pair(end_time=101.0)
+    assert snap.raw.size <= 480000
+    assert snap.raw.size % frame.size == 0
+    assert len(mic._pair_history) <= 4096
+    assert mic._pair_samples == sum(r["raw"].size for r in mic._pair_history)
+    count_bounded = Microphone()
+    one = np.ones(1, dtype=np.int16)
+    for i in range(4097):
+        count_bounded._append_diagnostic_pair(one, one, 100.0 + i / 10000,
+                                              50.0 + i / 10000)
+    assert len(count_bounded._pair_history) == 4096
+    age_bounded = Microphone()
+    for completed in (100.0, 110.0, 120.0, 131.0):
+        age_bounded._append_diagnostic_pair(one, one, completed, completed)
+    assert all(131.0 - r["completed"] <= 30.0 for r in age_bounded._pair_history)
+
+
+def test_diagnostic_pair_append_and_snapshot_are_thread_safe():
+    import threading
+    mic = Microphone()
+    frame = np.full(512, 7, dtype=np.int16)
+    start = threading.Event()
+    def append_many():
+        start.wait()
+        for i in range(300):
+            mic._append_diagnostic_pair(frame, frame, 100.0 + i / 1000,
+                                        50.0 + i / 1000)
+    worker = threading.Thread(target=append_many)
+    worker.start()
+    start.set()
+    for _ in range(300):
+        snap = mic.recent_diagnostic_pair(end_time=101.0)
+        assert snap.raw.size == snap.coverage["retained_samples"]
+        if snap.processed is not None:
+            assert snap.processed.shape == snap.raw.shape
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert mic._pair_samples == 300 * 512
+
+
+def test_diagnostic_pair_reference_generation_reset_and_nonmonotonic_source_break():
+    from types import SimpleNamespace
+    mic = Microphone()
+    class Echo:
+        active = True
+        def process(self, frame, _timestamp): return frame.copy()
+    echo = Echo()
+    echo.reference = SimpleNamespace(generation=1)
+    mic.echo = echo
+    frame = np.ones(512, dtype=np.int16)
+    mic._append_diagnostic_pair(frame, frame, 10.0, 20.0)
+    echo.reference.generation = 2
+    mic._append_diagnostic_pair(frame, frame, 10.1, 21.0)
+    snap = mic.recent_diagnostic_pair(end_time=10.2)
+    assert "echo_generation" in snap.coverage["break_reasons"]
+    mic._pair_history.clear()
+    mic._pair_samples = 0
+    mic._append_diagnostic_pair(frame, frame, 11.0, 30.0)
+    mic._append_diagnostic_pair(frame, frame, 11.1, 29.0)
+    snap = mic.recent_diagnostic_pair(end_time=11.2)
+    assert "nonmonotonic_source_time" in snap.coverage["break_reasons"]
+
+
+def test_diagnostic_pair_nonfinite_source_time_is_omitted():
+    mic = Microphone()
+    frame = np.ones(512, dtype=np.int16)
+    mic._append_diagnostic_pair(frame, frame, 10.0, float("nan"))
+    snap = mic.recent_diagnostic_pair(end_time=10.1)
+    assert snap.coverage["estimated_source_start"] is None
+    assert snap.coverage["estimated_source_end"] is None
+
+
+def test_diagnostic_pair_omits_both_source_bounds_when_first_is_unknown():
+    mic = Microphone()
+    frame = np.ones(512, dtype=np.int16)
+    mic._append_diagnostic_pair(frame, frame, 10.0, float("nan"))
+    mic._append_diagnostic_pair(frame, frame, 10.1, 20.1)
+    snap = mic.recent_diagnostic_pair(end_time=10.2)
+    assert snap.coverage["estimated_source_start"] is None
+    assert snap.coverage["estimated_source_end"] is None
+
+
+def test_diagnostic_pair_failed_read_is_a_break_and_failed_latest_fails_closed():
+    mic = Microphone()
+    frame = np.ones(512, dtype=np.int16)
+    mic._append_diagnostic_pair(frame, frame, 10.0, 20.0)
+    class BadArray:
+        def __array__(self, dtype=None, copy=None):
+            raise RuntimeError("synthetic copy failure")
+    mic._append_diagnostic_pair(BadArray(), frame, 10.1, 21.0)
+    middle = mic.recent_diagnostic_pair(end_time=10.15)
+    assert middle.coverage["status"] == "failed"
+    assert "pair_append_failure" in middle.coverage["break_reasons"]
+    mic._append_diagnostic_pair(frame, frame, 10.2, 22.0)
+    later = mic.recent_diagnostic_pair(end_time=10.25)
+    assert later.coverage["status"] == "partial"
+    assert later.raw.size == frame.size
+    assert "pair_append_failure" in later.coverage["break_reasons"]
+    mic._append_diagnostic_pair(frame, frame, 100.0, 110.0)
+    fresh = mic.recent_diagnostic_pair(seconds=1.0, end_time=100.1)
+    assert fresh.coverage["status"] == "available"  # no sticky lifetime failure
+
+
+def test_diagnostic_pair_snapshot_freezes_pending_tombstone_during_copy():
+    import threading
+    mic = Microphone()
+    entered = threading.Event()
+    release = threading.Event()
+    class SlowArray:
+        def __array__(self, dtype=None, copy=None):
+            entered.set()
+            assert release.wait(2)
+            return np.ones(512, dtype=np.int16)
+    frame = np.ones(512, dtype=np.int16)
+    writer = threading.Thread(target=mic._append_diagnostic_pair,
+                               args=(SlowArray(), frame, 10.0, 20.0))
+    writer.start()
+    assert entered.wait(2)
+    pending = mic.recent_diagnostic_pair(end_time=10.1)
+    assert pending.coverage["status"] == "missing"
+    assert pending.raw.size == 0
+    release.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    assert pending.coverage["status"] == "missing"  # copied snapshot did not change
+    assert mic.recent_diagnostic_pair(end_time=10.1).coverage["status"] == "available"
+
+
+def test_diagnostic_pair_stale_pending_commit_cannot_restore_closed_history():
+    import threading
+    mic = Microphone()
+    entered = threading.Event()
+    release = threading.Event()
+    class SlowArray:
+        def __array__(self, dtype=None, copy=None):
+            entered.set()
+            assert release.wait(2)
+            return np.ones(512, dtype=np.int16)
+    frame = np.ones(512, dtype=np.int16)
+    writer = threading.Thread(target=mic._append_diagnostic_pair,
+                               args=(SlowArray(), frame, 10.0, 20.0))
+    writer.start()
+    assert entered.wait(2)
+    mic.__exit__()
+    release.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    assert not mic._pair_history
+    mic._append_diagnostic_pair(frame, frame, 10.2, 21.0)
+    snap = mic.recent_diagnostic_pair(end_time=10.3)
+    assert snap.coverage["status"] == "available"
+    assert snap.raw.size == frame.size
+    assert snap.coverage["read_start"] == 1
+
+
+def test_diagnostic_pair_stale_pending_commit_after_flush_stays_a_break():
+    import threading
+    mic = Microphone()
+    entered = threading.Event()
+    release = threading.Event()
+    class SlowArray:
+        def __array__(self, dtype=None, copy=None):
+            entered.set()
+            assert release.wait(2)
+            return np.ones(512, dtype=np.int16)
+    frame = np.ones(512, dtype=np.int16)
+    writer = threading.Thread(target=mic._append_diagnostic_pair,
+                               args=(SlowArray(), frame, 10.0, 20.0))
+    writer.start()
+    assert entered.wait(2)
+    mic.flush()
+    release.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    mic._append_diagnostic_pair(frame, frame, 10.2, 21.0)
+    snap = mic.recent_diagnostic_pair(end_time=10.3)
+    assert snap.coverage["status"] == "partial"
+    assert snap.raw.size == frame.size
+    assert "flush" in snap.coverage["break_reasons"]
 
 
 def test_attached_but_inactive_echo_is_not_archived_as_processed():
@@ -141,6 +478,22 @@ def test_callback_queue_overflow_is_counted_and_warning_is_rate_limited(caplog, 
     mic.read()
     assert len([record for record in caplog.records
                 if "callback queue overflowed" in record.message]) == 1
+
+
+def test_callback_status_is_reported_from_read_not_callback(caplog, monkeypatch):
+    from assistant import audio
+    monkeypatch.setattr(audio.log, "handlers", [caplog.handler])
+    monkeypatch.setattr(audio.log, "propagate", False)
+    mic = Microphone()
+    data = np.ones((512, 1), dtype=np.int16)
+
+    mic._callback(data, 512, None, "input_overflow")
+    assert not caplog.records
+    mic.read()
+    warnings = [record for record in caplog.records
+                if "callback reported status" in record.message]
+    assert len(warnings) == 1
+    assert "input_overflow" in warnings[0].message
 
 
 @pytest.mark.parametrize("failure", ["start", "canceller"])
@@ -346,10 +699,17 @@ def test_reopen_preserves_pinned_input_and_recreates_resampler(monkeypatch):
     mic = Microphone(device="Realtek", capture_rate=48000)
     previous = mic._resampler
     mic._ring.append(np.ones(512, dtype=np.int16))
+    mic._callback(np.ones((512, 1), dtype=np.int16), 512, None, None)
+    mic._append_diagnostic_pair(np.ones(512, dtype=np.int16),
+                                np.ones(512, dtype=np.int16), 1.0, 1.0)
+    generation = mic.recent_diagnostic_pair(end_time=1.1).coverage["diagnostic_generation"]
     enter = Mock()
     monkeypatch.setattr(Microphone, "__enter__", enter)
     mic.reopen()
     assert mic._resampler is not None and mic._resampler is not previous
     candidates.assert_called_with("Realtek", False)
     assert not mic._ring
+    assert mic.recent_diagnostic_audio().size == 0
+    assert mic.recent_diagnostic_pair(end_time=1.1).raw.size == 0
+    assert mic.recent_diagnostic_pair(end_time=1.1).coverage["diagnostic_generation"] > generation
     enter.assert_called_once()

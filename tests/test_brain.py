@@ -715,6 +715,40 @@ def test_compound_play_preserves_requested_absolute_volume(tool, args, heard, qu
         assert intent.volume_after_play == 20
 
 
+@pytest.mark.parametrize("heard", [
+    "play madira by seedhe maut at 65% volume",
+    "play madira by seedhe maut on 65 percent volume.",
+    "play madira by seedhe maut with 65 volume",
+    "play madira by seedhe maut, at 65% volume!",
+    "play madira by seedhe maut and 65% volume",
+])
+@pytest.mark.parametrize("include_argument", [False, True])
+def test_numeric_before_volume_suffix_is_grounded_and_removed_from_track_query(heard, include_argument):
+    arguments = {"title": "Madira", "artist": "Seedhe Maut"}
+    if include_argument:
+        arguments["volume_after_play"] = 65
+    intent = brain().to_intent(call("play_song", **arguments), heard)
+    assert intent.query == "madira by seedhe maut"
+    assert intent.volume_after_play == 65
+
+
+@pytest.mark.parametrize("heard", ["play madira at 150% volume", "play madira on 150 percent volume"])
+def test_numeric_before_volume_out_of_range_stays_unsupported(heard):
+    model = Mock()
+    intent = decide(heard, model)
+    assert intent.action is Action.UNKNOWN
+    model.decide.assert_not_called()
+
+
+def test_numeric_before_volume_suffix_survives_model_failure():
+    model = Mock()
+    model.decide.side_effect = TimeoutError("slow")
+    intent = decide("play madira with 65 percent volume", model)
+    assert intent.action is Action.PLAY_TRACK
+    assert intent.query == "madira"
+    assert intent.volume_after_play == 65
+
+
 def test_play_volume_tail_is_not_part_of_artist_grounding():
     intent = brain().to_intent(call("play_song", title="Madira", artist="Seedhe Maut"),
                                "play madira by see the mode at full volume")

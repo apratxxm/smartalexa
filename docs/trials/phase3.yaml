@@ -1,0 +1,23 @@
+timeout_seconds: 25
+thresholds: {apps: 5, onscreen: 5, codex: 5, negatives: 5}
+lines:
+  - {id: A1, mode: normal, category: apps, capability: open_app, phrase: 'Alexa, open Spotify'}
+  - {id: A2, mode: normal, category: apps, capability: open_app, phrase: 'Alexa, open Opera'}
+  - {id: A3, mode: normal, category: apps, capability: open_app, phrase: 'Alexa, open Calculator'}
+  - {id: A4, mode: normal, category: apps, capability: search_browser, phrase: 'Alexa, search for cats'}
+  - {id: A5, mode: normal, category: apps, capability: search_browser, phrase: 'Alexa, google weather'}
+  - {id: S1, mode: normal, category: onscreen, capability: show_track, phrase: 'Alexa, show the song Halo'}
+  - {id: S2, mode: normal, category: onscreen, capability: show_album, phrase: 'Alexa, show the album Lover'}
+  - {id: S3, mode: normal, category: onscreen, capability: show_track, phrase: 'Alexa, show me the song Hello'}
+  - {id: S4, mode: normal, category: onscreen, capability: show_track, phrase: 'Alexa, show the song Yellow'}
+  - {id: S5, mode: normal, category: onscreen, capability: show_album, phrase: 'Alexa, show the album Folklore'}
+  - {id: C1, mode: normal, category: codex, capability: codex_request, phrase: 'Alexa, ask codex to add a hello world comment to notes dot txt', note: 'Requires [core.codex] project_dir with notes.txt as a scratch file. Verify the observed receipt.'}
+  - {id: C2, mode: normal, category: codex, capability: codex_request, phrase: 'Alexa, ask codex to add a greeting comment to notes dot txt', note: 'Only the notes.txt scratch file in [core.codex] project_dir; verify observed receipt.'}
+  - {id: C3, mode: normal, category: codex, capability: codex_request, phrase: 'Alexa, ask codex to add a short reminder to notes dot txt', note: 'Only the notes.txt scratch file in [core.codex] project_dir; verify observed receipt.'}
+  - {id: C4, mode: normal, category: codex, capability: codex_request, phrase: 'Alexa, ask codex to add a test comment to notes dot txt', note: 'Only the notes.txt scratch file in [core.codex] project_dir; verify observed receipt.'}
+  - {id: C5, mode: normal, category: codex, capability: codex_request, phrase: 'Alexa, ask codex to add a welcome comment to notes dot txt', note: 'Only the notes.txt scratch file in [core.codex] project_dir; verify observed receipt.'}
+  - {id: N1, mode: normal, category: negatives, kind: codex_question, phrase: 'Alexa, what is Codex used for?', note: 'Must not trigger Codex.'}
+  - {id: N2, mode: normal, category: negatives, kind: correction, phrase: 'Alexa, ask codex to add a comment to notes dot txt I take that back', note: 'Must not trigger Codex.'}
+  - {id: N3, mode: normal, category: negatives, kind: hypothetical, phrase: 'Alexa, ask codex to add a comment to notes dot txt for example', note: 'Must not trigger Codex.'}
+  - {id: N4, mode: normal, category: negatives, kind: reported, phrase: 'Alexa, he said ask codex to add a comment to notes dot txt', note: 'Must not trigger Codex.'}
+  - {id: N5, mode: normal, category: negatives, kind: truncated, phrase: 'Alexa, ask codex to', note: 'Must not trigger Codex.'}

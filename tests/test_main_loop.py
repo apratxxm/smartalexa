@@ -1,5 +1,6 @@
 """Exercise daemon loop control flow without devices, models, or Spotify."""
 import threading
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -10,7 +11,335 @@ import numpy as np
 import pytest
 
 from assistant import main
+from assistant.runtime import create_collection_pause, collection_pause_acknowledged
 from assistant.config import Config
+
+
+@pytest.mark.parametrize("audio_saved,indexed", [(True, True), (True, False), (False, True)])
+def test_reported_miss_is_short_unknown_and_acknowledged_only_if_indexed(audio_saved, indexed):
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.telemetry = Mock(sample_rate=16000)
+    app.listener = SimpleNamespace(_in_speech=False, flush=Mock())
+    app.wake = Mock()
+    mic = Mock()
+    mic.recent_diagnostic_audio.return_value = np.ones(30 * 16000, dtype=np.int16)
+    app._say_feedback = Mock()
+    order = []
+    @contextlib.contextmanager
+    def duck(_event, _percent):
+        order.append("duck")
+        try:
+            yield
+        finally:
+            order.append("restore")
+    app._duck_music = Mock(side_effect=lambda event, percent: duck(event, percent))
+
+    def save(event, pcm):
+        event.audio_status = "saved" if audio_saved else "failed"
+        return "assistant/logs/audio/reported.wav" if audio_saved else ""
+
+    app.telemetry.save_audio.side_effect = save
+    app.telemetry.write.return_value = indexed
+    assert app._record_reported_miss(mic) is (audio_saved and indexed)
+    mic.recent_diagnostic_audio.assert_called_once()
+    assert mic.recent_diagnostic_audio.call_args.args == (30.0,)
+    assert isinstance(mic.recent_diagnostic_audio.call_args.kwargs["end_time"], float)
+    app._say_feedback.assert_not_called()  # report callback only queues the receipt
+    app.listener.flush.assert_not_called()
+    mic.flush.assert_not_called()
+    assert app._drain_reported_miss_receipt(mic)
+    event, pcm = app.telemetry.save_audio.call_args.args
+    assert pcm.size == 30 * 16000 and event.audio_duration_ms == 30000
+    assert event.end_reason == "user_reported_context_30_seconds"
+    assert event.trigger_source == "miss" and event.review_state == "unknown"
+    assert event.segment_id == event.event_id and event.wake_score is None
+    if audio_saved and indexed:
+        app._say_feedback.assert_called_once_with(mic, "Saved for review.", event)
+    else:
+        app._say_feedback.assert_called_once_with(mic, "Could not save.", event)
+    assert order == ["duck", "restore"]
+    assert app.listener.flush.call_count == 1  # owner reset after speaking
+    app.wake.reset.assert_called_once()
+    assert not app._drain_reported_miss_receipt(mic)
+
+
+@pytest.mark.parametrize("failed_stage", [None, "snapshot", "archive"])
+def test_reported_miss_freezes_both_streams_before_writing_and_keeps_parent_receipt(monkeypatch, failed_stage):
+    app = main.Assistant.__new__(main.Assistant)
+    app.telemetry = Mock(sample_rate=16000)
+    order = []
+    raw = np.ones(512, dtype=np.int16)
+    pair = main.DiagnosticPairSnapshot(raw.copy(), raw.copy(), {})
+    monkeypatch.setattr(main.time, "perf_counter", lambda: 123.5)
+
+    def raw_snapshot(seconds, *, end_time):
+        order.append("raw_snapshot")
+        assert seconds == 30.0 and end_time == 123.5
+        return raw
+
+    def pair_snapshot(seconds, *, end_time):
+        order.append("pair_snapshot")
+        assert seconds == 30.0 and end_time == 123.5
+        if failed_stage == "snapshot":
+            raise RuntimeError("optional diagnostic failure")
+        return pair
+
+    def save(event, pcm):
+        order.append("parent_audio")
+        event.audio_status = "saved"
+        return "reported.wav"
+
+    def index(event):
+        order.append("parent_index")
+        return True
+
+    def archive(parent, paired_raw, processed, *, coverage, parent_indexed):
+        order.append("diagnostic_archive")
+        assert parent.audio_path == "reported.wav" and parent_indexed is True
+        assert paired_raw is pair.raw and processed is pair.processed
+        if failed_stage == "archive":
+            raise RuntimeError("optional archive failure")
+        return main.Event(trigger_source="miss_diagnostic")
+
+    app.telemetry.save_audio.side_effect = save
+    app.telemetry.write.side_effect = index
+    app.telemetry.record_report_diagnostic.side_effect = archive
+    mic = SimpleNamespace(recent_diagnostic_audio=raw_snapshot,
+                          recent_diagnostic_pair=pair_snapshot)
+    assert app._record_reported_miss(mic)
+    assert order[:4] == ["raw_snapshot", "pair_snapshot", "parent_audio", "parent_index"]
+    assert order[4:] == ([] if failed_stage == "snapshot" else ["diagnostic_archive"])
+    assert app._pending_reported_miss_receipt[0] == "Saved for review."
+
+
+def test_reported_miss_archives_separate_real_paired_child_in_temporary_storage(monkeypatch, tmp_path):
+    from assistant.audio import Microphone
+    from assistant.telemetry import Telemetry
+
+    root = tmp_path / "assistant" / "logs"
+    telemetry = Telemetry(Config({"telemetry": {
+        "jsonl_path": str(root / "telemetry.jsonl"),
+        "audio_dir": str(root / "audio"), "archive_audio": True,
+        "max_audio_mb": 2}, "audio": {"sample_rate": 16000}}))
+    monkeypatch.setattr(main.time, "perf_counter", lambda: 100.0)
+    mic = Microphone()
+    mic._callback(np.full((1024, 1), 9, dtype=np.int16), 1024, None, None)
+    mic._append_diagnostic_pair(np.full(512, 7, dtype=np.int16),
+                                np.full(512, 3, dtype=np.int16), 99.9, 99.9)
+    app = main.Assistant.__new__(main.Assistant)
+    app.telemetry = telemetry
+    assert app._record_reported_miss(mic)
+    parent, child = [json.loads(line) for line in telemetry.jsonl_path.read_text().splitlines()]
+    assert parent["trigger_source"] == "miss" and not parent["processed_audio_path"]
+    assert child["trigger_source"] == "miss_diagnostic"
+    assert child["overlap_of"] == parent["event_id"]
+    assert child["diagnostic_only"] is True and child["review_state"] == "unknown"
+    assert child["audio_status"] == child["processed_audio_status"] == "saved"
+    assert child["diagnostic_metadata"]["saved_samples"] == 512
+    assert child["diagnostic_metadata"]["coverage"]["window_end"] == 100.0
+    assert parent["audio_sha256"] != child["audio_sha256"]
+
+
+def test_reported_miss_is_debounced_without_second_save(monkeypatch):
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.telemetry = Mock(sample_rate=16000)
+    app.listener = SimpleNamespace(_in_speech=False, flush=Mock())
+    app.wake = Mock()
+    app._say_feedback = Mock()
+    app._duck_music = Mock(return_value=contextlib.nullcontext())
+    mic = Mock()
+    mic.recent_diagnostic_audio.return_value = np.ones(16000, dtype=np.int16)
+    ticks = iter([10.0, 10.1, 11.0, 11.1, 11.2])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(ticks))
+    def save(event, _pcm):
+        event.audio_status = "saved"
+        return "reported.wav"
+    app.telemetry.save_audio.side_effect = save
+    app.telemetry.write.return_value = True
+
+    assert app._record_reported_miss(mic)
+    assert not app._record_reported_miss(mic)
+    app._say_feedback.assert_not_called()
+    assert app._drain_reported_miss_receipt(mic)
+    app.telemetry.save_audio.assert_called_once()
+    app._say_feedback.assert_called_once_with(mic, "Saved for review.",
+                                              app.telemetry.save_audio.call_args.args[0])
+
+
+def test_reported_miss_after_long_interaction_keeps_earlier_mic_segment(monkeypatch):
+    from assistant.audio import Microphone
+    import assistant.audio as audio_module
+
+    perf_now = [100.0]
+    monkeypatch.setattr(audio_module.time, "perf_counter", lambda: perf_now[0])
+    mic = Microphone()
+    earlier = np.full((8 * 16000, 1), 7, dtype=np.int16)
+    later = np.full((8 * 16000, 1), 13, dtype=np.int16)
+    mic._callback(earlier, len(earlier), None, None)
+    mic.flush()
+    perf_now[0] = 124.0
+    mic._callback(later, len(later), None, None)
+
+    app = main.Assistant.__new__(main.Assistant)
+    app.telemetry = Mock(sample_rate=16000)
+    app.telemetry.save_audio.side_effect = lambda event, pcm: (
+        setattr(event, "audio_status", "saved") or "reported.wav")
+    app.telemetry.write.return_value = True
+    app._say_feedback = Mock()
+
+    assert app._record_reported_miss(mic)
+    event, pcm = app.telemetry.save_audio.call_args.args
+    assert event.end_reason == "user_reported_context_30_seconds"
+    assert event.audio_duration_ms >= 13_000
+    assert np.any(pcm == 7) and np.any(pcm == 13)
+    app._say_feedback.assert_not_called()
+
+
+def test_reported_miss_pending_receipt_is_bounded_and_replaced(monkeypatch):
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.telemetry = Mock(sample_rate=16000)
+    app.listener = SimpleNamespace(_in_speech=False, flush=Mock())
+    app.wake = Mock()
+    app._say_feedback = Mock()
+    app._duck_music = Mock(return_value=contextlib.nullcontext())
+    mic = Mock()
+    mic.recent_diagnostic_audio.return_value = np.ones(16000, dtype=np.int16)
+    ticks = iter([10.0, 10.1, 12.1, 12.2, 12.3])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(ticks))
+    def save(event, _pcm):
+        event.audio_status = "saved"
+        return "reported.wav"
+    app.telemetry.save_audio.side_effect = save
+    app.telemetry.write.return_value = True
+
+    assert app._record_reported_miss(mic)
+    old_event = app.telemetry.save_audio.call_args.args[0]
+    assert app._record_reported_miss(mic)
+    new_event = app.telemetry.save_audio.call_args.args[0]
+    assert old_event is not new_event
+    assert app._pending_reported_miss_receipt[1] is new_event
+    assert app._drain_reported_miss_receipt(mic)
+    app._say_feedback.assert_called_once_with(mic, "Saved for review.", new_event)
+    assert app._pending_reported_miss_receipt is None
+    assert not app._drain_reported_miss_receipt(mic)
+
+
+def test_reported_miss_drain_uses_async_audio_owner_handoff():
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.async_capture = Mock()
+    app.listener = SimpleNamespace(_in_speech=False)
+    app._say_feedback = Mock()
+    app._duck_music = Mock(return_value=contextlib.nullcontext())
+    event = main.Event(trigger_source="miss", review_state="unknown")
+    app._pending_reported_miss_receipt = ("Saved for review.", event, time.monotonic())
+    app._run_async_owned_callback = Mock(side_effect=lambda _mic, callback, **_kwargs: callback() or True)
+
+    assert app._drain_reported_miss_receipt(Mock())
+    app._run_async_owned_callback.assert_called_once()
+    assert app._run_async_owned_callback.call_args.kwargs["reason"] == "reported miss receipt"
+    app._say_feedback.assert_called_once_with(
+        app._run_async_owned_callback.call_args.args[0], "Saved for review.", event)
+
+
+def test_reported_miss_receipt_waits_until_listening_resumes():
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.telemetry = Mock(sample_rate=16000)
+    app.listener = SimpleNamespace(_in_speech=False, flush=Mock())
+    app.wake = Mock()
+    app._say_feedback = Mock()
+    app._duck_music = Mock(return_value=contextlib.nullcontext())
+    app._paused_flag = True
+    mic = Mock()
+    app._pending_reported_miss_receipt = ("Could not save.", main.Event(
+        trigger_source="miss", review_state="unknown"), time.monotonic())
+
+    assert not app._drain_reported_miss_receipt(mic)
+    app._say_feedback.assert_not_called()
+    app._paused_flag = False
+    assert app._drain_reported_miss_receipt(mic)
+    app._say_feedback.assert_called_once_with(
+        mic, "Could not save.", app._say_feedback.call_args.args[2])
+
+
+def test_old_queued_receipt_can_pass_unaccepted_speech_and_noise_guards(monkeypatch):
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode = "stt"
+    app.cfg = Config({"ducking": {"duck_to_percent": 20}})
+    app.listener = SimpleNamespace(_in_speech=True)
+    app.wake = None
+    app._say_feedback = Mock()
+    app._duck_music = Mock(return_value=contextlib.nullcontext())
+    queued_at = 10.0
+    app._pending_reported_miss_receipt = (
+        "Saved for review.", main.Event(trigger_source="miss"), queued_at)
+    app._last_strong_wake = (19.5, 0.8, "alexa")
+    monkeypatch.setattr(main.time, "monotonic", lambda: 20.1)
+
+    assert app._drain_reported_miss_receipt(Mock())
+    app._say_feedback.assert_called_once()
+
+
+def test_expired_probe_pause_resumes_and_resets_once(tmp_path, monkeypatch):
+    flag = tmp_path / "pause"
+    flag.write_text(json.dumps(dict(schema="memoir.probe-pause.v1", owner="probe-test",
+                                   issued_at=100, expires_at=400)))
+    monkeypatch.setattr(main, "PAUSE_FLAG", flag)
+    monkeypatch.setattr(main.time, "time", lambda: 400)
+    ticks = iter([10.0, 10.1, 11.0])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(ticks))
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode, app.listener, app.wake = "stt", Mock(), Mock()
+    app._paused_flag = True
+    assert not app._listening_paused()
+    assert not app._listening_paused()
+    assert not app._listening_paused()
+    app.listener.flush.assert_called_once()
+    app.wake.reset.assert_called_once()
+    assert flag.exists()
+
+
+def test_collection_pause_ack_follows_main_reset_even_when_already_paused(tmp_path, monkeypatch):
+    flag = tmp_path / ".listening_paused"
+    lease_dir = tmp_path / "collection_pauses"
+    monkeypatch.setattr(main, "PAUSE_FLAG", flag)
+    ticks = iter([10.0])
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(ticks))
+    app = main.Assistant.__new__(main.Assistant)
+    order = []
+    app.mode = "stt"
+    app.listener = SimpleNamespace(flush=lambda: order.append("flush"))
+    app.wake = SimpleNamespace(reset=lambda: order.append("reset"))
+    app._paused_flag = True
+    capture_id = "e" * 32
+    create_collection_pause(lease_dir, capture_id)
+    assert not collection_pause_acknowledged(lease_dir, capture_id)
+    assert app._listening_paused()
+    assert order == ["flush", "reset"]
+    assert collection_pause_acknowledged(lease_dir, capture_id)
+
+
+def test_collection_namespace_overflow_keeps_main_paused_without_ack(tmp_path, monkeypatch):
+    flag = tmp_path / ".listening_paused"
+    lease_dir = tmp_path / "collection_pauses"
+    monkeypatch.setattr(main, "PAUSE_FLAG", flag)
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+    app = main.Assistant.__new__(main.Assistant)
+    app.mode, app.listener, app.wake = "stt", Mock(), Mock()
+    app._paused_flag = True
+    for index in range(33):
+        create_collection_pause(lease_dir, f"{index:032x}")
+    assert app._listening_paused()
+    assert not list(lease_dir.glob("*.ack"))
 
 
 @pytest.fixture(autouse=True)
@@ -707,20 +1036,25 @@ def test_global_router_runtime_gate_blocks_failed_warmup_until_retry_admission()
     router.route.assert_called_once_with("inspect this project")
 
 
-@pytest.mark.parametrize(("backend", "conversation_enabled", "expected_num_ctx"), [
-    ("brain", False, 4096),
-    ("brain", True, 8192),
-    ("rules", True, 8192),
-    ("rules", False, None),
+@pytest.mark.parametrize(("backend", "conversation_enabled", "selector", "expected_num_ctx"), [
+    ("brain", False, None, 4096),
+    ("brain", True, None, 8192),
+    ("brain", True, "concise", 4096),
+    ("rules", True, "standard", 8192),
+    ("rules", True, "concise", 4096),
+    ("rules", False, "concise", None),
 ])
 def test_assistant_injects_one_runtime_into_brain_and_global_router(
-        monkeypatch, backend, conversation_enabled, expected_num_ctx):
+        monkeypatch, backend, conversation_enabled, selector, expected_num_ctx):
     values = {
         "intent.backend": backend, "intent.model": "local-test-model",
         "intent.timeout_seconds": 4.0, "conversation.enabled": conversation_enabled,
         "listener.mode": "stt", "ducking.duck_trigger": "none",
         "stt.bias_from_spotify": False, "codex.enabled": True,
     }
+    if selector is not None:
+        values["conversation.interpreter"] = selector
+    expected_selector = selector or "standard"
     cfg = SimpleNamespace(get=lambda key, default=None: values.get(key, default))
 
     class FakeFeedback:
@@ -759,11 +1093,13 @@ def test_assistant_injects_one_runtime_into_brain_and_global_router(
     monkeypatch.setattr(main, "Endpointer", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(main.Assistant, "_load_vocabulary",
                         lambda _self: {"artists": [], "hints": []})
-    monkeypatch.setattr(main.threading.Thread, "start", lambda _thread: None)
+    thread_starts = []
+    monkeypatch.setattr(main.threading.Thread, "start", lambda thread: thread_starts.append(thread))
     monkeypatch.setattr(global_assistant, "GlobalAssistant", FakeGlobalAssistant)
 
     assistant = main.Assistant()
     runtime = assistant._model_runtime
+    assert assistant._conversation_interpreter == expected_selector
     if expected_num_ctx is None:
         assert runtime is None
         assert assistant.brain is None
@@ -776,6 +1112,37 @@ def test_assistant_injects_one_runtime_into_brain_and_global_router(
         assert assistant.global_assistant.router.runtime is runtime
         assert assistant.global_assistant.router.router.runtime is runtime
         assert assistant.global_assistant.router.router.model == runtime.model
+        assert len(thread_starts) == 1
+        if conversation_enabled:
+            values["conversation.interpreter"] = (
+                "standard" if expected_selector == "concise" else "concise")
+            coordinator = assistant._conversation_instance()
+            if expected_selector == "concise":
+                from assistant.concise_brain import ConciseConversationBrain
+                assert isinstance(coordinator.interpreter, ConciseConversationBrain)
+            else:
+                from assistant.conversation_brain import ConversationBrain
+                assert isinstance(coordinator.interpreter, ConversationBrain)
+            assert coordinator.interpreter._runtime is runtime
+            assert coordinator.interpreter._readiness.__self__ is assistant
+            assert coordinator.interpreter._readiness.__func__ is main.Assistant._conversation_ready
+            assert assistant._conversation_instance() is coordinator
+
+
+@pytest.mark.parametrize("selector", [None, True, 1, [], "unknown"])
+def test_invalid_conversation_interpreter_fails_before_startup_side_effects(
+        monkeypatch, selector):
+    values = {"conversation.interpreter": selector}
+    cfg = SimpleNamespace(get=lambda key, default=None: values.get(key, default))
+    telemetry_calls = []
+    spotify_calls = []
+    monkeypatch.setattr(main, "load", lambda: cfg)
+    monkeypatch.setattr(main, "Telemetry", lambda _cfg: telemetry_calls.append(_cfg))
+    monkeypatch.setattr(main, "Spotify", lambda: spotify_calls.append(True))
+    with pytest.raises(ValueError, match="conversation.interpreter"):
+        main.Assistant()
+    assert telemetry_calls == []
+    assert spotify_calls == []
 
 
 @pytest.mark.parametrize("reply", ["cancel", "start again"])
@@ -2733,6 +3100,93 @@ def _repeat_app(transcripts):
     app.stt.transcribe.side_effect = [(t, 10) for t in transcripts]
     app._duck_music = lambda *a, **k: contextlib.nullcontext()
     return app
+
+
+def _managed_capture_runtime(*, authorized=True):
+    return SimpleNamespace(started=True, closed=False,
+                           foreground_authorized=authorized)
+
+
+def _managed_capture_pointer():
+    return SimpleNamespace(record=Mock(), frame_ms=32.0, timeout_frames=20,
+                           utterance_frames=100, max_frames=120,
+                           silence_frames=20, threshold=0.5)
+
+
+def test_bare_wake_uses_managed_capture_after_prompt_settles():
+    audio = np.arange(16000, dtype=np.int16)
+    followup = np.full(512, 12, dtype=np.int16)
+    captured = {"audio": followup, "duration_ms": 32, "speech_started": True,
+                "speech_start_ms": 0, "speech_end_ms": 32}
+    app = _retained_wake_handler_app([("Alexa", 18), ("pause", 20)], captured)
+    app.cfg = Config({"listener": {"phrases": ["alexa"]},
+                      "capture": {"playback_settle_ms": 0}})
+    app.async_capture = _managed_capture_runtime()
+    app.endpointer = _managed_capture_pointer()
+    sequence = []
+    app.feedback.speaks_on_wake = True
+    app.feedback.wake.side_effect = lambda: sequence.append("prompt_finished") or main.KIND_SPEECH
+    app.feedback.listening.side_effect = lambda: sequence.append("listening")
+    mic = Mock()
+    mic.flush.side_effect = lambda: sequence.append("settled_and_flushed")
+    app._foreground_capture_driver = Mock()
+    app._foreground_capture_driver.record.side_effect = (
+        lambda *_args, **_kwargs: sequence.append("capture") or captured)
+    utt = SimpleNamespace(command="", confirmed_audio_handoff=True, truncated=False,
+                          matched_phrase="alexa", transcript="Alexa", latency_ms=2,
+                          audio=audio)
+
+    app.handle_utterance(mic, utt)
+
+    # The final flush is the existing handler cleanup, after capture completes.
+    assert sequence == ["prompt_finished", "listening", "settled_and_flushed",
+                        "capture", "settled_and_flushed"]
+    app._foreground_capture_driver.record.assert_called_once()
+    assert app._foreground_capture_driver.record.call_args.kwargs["mode"] == "command"
+    assert app._foreground_capture_driver.record.call_args.kwargs["turn_id"].endswith(
+        "-bare-follow-up")
+    assert app.telemetry.write.call_args.args[0].transcript == "Alexa | pause"
+
+
+def test_repeated_wake_uses_managed_capture_without_blocking_endpointer():
+    app = _repeat_app(["pause"])
+    app.async_capture = _managed_capture_runtime()
+    app.endpointer = _managed_capture_pointer()
+    audio = np.zeros(512, dtype=np.int16)
+    captured = {"audio": audio, "duration_ms": 32, "speech_started": True}
+    app._foreground_capture_driver = Mock()
+    app._foreground_capture_driver.record.return_value = captured
+
+    text, result, latency = app._past_repeated_wake(
+        Mock(), SimpleNamespace(event_id="repeat-turn"), "Alexa", {}, 5)
+
+    assert (text, result, latency) == ("pause", captured, 15)
+    app._foreground_capture_driver.record.assert_called_once()
+    app.endpointer.record.assert_not_called()
+
+
+def test_managed_capture_refuses_incomplete_handoff_without_legacy_fallback():
+    app = main.Assistant.__new__(main.Assistant)
+    app.async_capture = _managed_capture_runtime(authorized=False)
+    pointer = Mock()
+
+    with pytest.raises(RuntimeError, match="has not authorized foreground recording"):
+        app._record_foreground_reply(
+            Mock(), pointer, mode="command", turn_id="incomplete-handoff")
+
+    pointer.record.assert_not_called()
+
+
+def test_legacy_capture_preserves_after_prompt_argument():
+    app = main.Assistant.__new__(main.Assistant)
+    pointer = Mock()
+    mic = Mock()
+    result = {"audio": np.zeros(512, dtype=np.int16), "speech_started": True}
+    pointer.record.return_value = result
+
+    assert app._record_foreground_reply(
+        mic, pointer, mode="command", turn_id="legacy", after_prompt=True) is result
+    pointer.record.assert_called_once_with(mic, after_prompt=True)
 
 
 def test_repeated_wake_keeps_listening_for_the_command():

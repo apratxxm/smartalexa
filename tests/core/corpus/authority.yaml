@@ -1,0 +1,300 @@
+# Labelled utterance corpus for the whole-utterance authority grammar.
+# Source of truth: docs/CAPABILITY_CONTRACT.md ("Authority method", "Special rules",
+# "Review dispositions" C1-C8). Capability and argument names: assistant/conversation_contracts.py::CAPABILITIES.
+# Entry fields: text, expect (admit|refuse), capability?, args? (only where unambiguous), c1? (true = admit only on exact match), why.
+# Refusals carry capability/args only when an argument mismatch is the point of the entry.
+- {text: "play Halo", expect: admit, capability: play_song, args: {title: "Halo"}, why: "explicit play request"}
+- {text: "can you play Halo", expect: admit, capability: play_song, why: "polite prefix"}
+- {text: "could you play Halo please", expect: admit, capability: play_song, why: "polite prefix and suffix"}
+- {text: "please play Halo", expect: admit, capability: play_song, why: "bare please prefix"}
+- {text: "play Halo thank you", expect: admit, capability: play_song, why: "polite suffix thank you"}
+- {text: "play Halo.", expect: admit, capability: play_song, args: {title: "Halo"}, why: "Whisper final period stripped at the end"}
+- {text: "Play Halo!", expect: admit, capability: play_song, args: {title: "Halo"}, why: "Whisper capitalisation and final exclamation stripped"}
+- {text: "put on some Beyonc\u00e9", expect: admit, capability: play_song, why: "put on verb; free-text object with accented letter"}
+- {text: "play Simon and Garfunkel", expect: admit, capability: play_song, why: "and not followed by a second verb is object text"}
+- {text: "play Don't Stop Believin'", expect: admit, capability: play_song, c1: true, why: "C1 exact match required (negation word in object)"}
+- {text: "play When I Was Your Man", expect: admit, capability: play_song, c1: true, why: "C1 exact match required (conditional word in object)"}
+- {text: "start Halo", expect: admit, capability: play_song, why: "start as play verb"}
+- {text: "pause", expect: admit, capability: pause, why: "bare pause"}
+- {text: "pause the music", expect: admit, capability: pause, why: "explicit pause"}
+- {text: "hold the music", expect: admit, capability: pause, why: "hold as pause verb"}
+- {text: "stop the music", expect: admit, capability: pause, why: "stop the music maps to pause"}
+- {text: "pause please", expect: admit, capability: pause, why: "polite suffix"}
+- {text: "please pause", expect: admit, capability: pause, why: "polite prefix"}
+- {text: "resume", expect: admit, capability: resume, why: "bare resume"}
+- {text: "continue music", expect: admit, capability: resume, why: "continue as resume verb"}
+- {text: "unpause", expect: admit, capability: resume, why: "unpause as resume verb"}
+- {text: "can you resume the music please", expect: admit, capability: resume, why: "polite prefix and suffix on resume"}
+- {text: "next", expect: admit, capability: next_track, why: "bare next"}
+- {text: "skip this song", expect: admit, capability: next_track, why: "skip this song"}
+- {text: "skip this one", expect: admit, capability: next_track, why: "skip this one"}
+- {text: "skip to the next track", expect: admit, capability: next_track, why: "explicit next track"}
+- {text: "previous track", expect: admit, capability: previous_track, why: "phase 1b; verb phrase assumed, contract names none"}
+- {text: "restart the track", expect: admit, capability: restart_track, why: "phase 1b; verb phrase assumed, contract names none"}
+- {text: "restart the album", expect: admit, capability: restart_album, why: "phase 1b; verb phrase assumed, contract names none"}
+- {text: "queue Halo", expect: admit, capability: queue_song, why: "phase 1b; queue verb, title object"}
+- {text: "play the album Lover", expect: admit, capability: play_album, why: "phase 1b; album verb phrase assumed"}
+- {text: "play music by Beyonc\u00e9", expect: admit, capability: play_artist, why: "phase 1b; artist-only phrasing assumed"}
+- {text: "play my playlist Gym", expect: admit, capability: play_playlist, why: "phase 1b; playlist verb phrase assumed"}
+- {text: "play Halo if I ask", expect: refuse, why: "conditional word; no exact title match"}
+- {text: "play Halo unless I cancel", expect: refuse, why: "conditional word and cancel"}
+- {text: "play Halo in case I ask", expect: refuse, why: "conditional phrase; no exact title match"}
+- {text: "play Halo when I say so", expect: refuse, why: "conditional word; no exact title match"}
+- {text: "play Halo as soon as you can", expect: refuse, why: "conditional phrase; no exact title match"}
+- {text: "skip until I say stop", expect: refuse, why: "conditional word until"}
+- {text: "play Halo, no, cancel that", expect: refuse, why: "correction words and comma; discarded prefix"}
+- {text: "play Halo. Stop.", expect: refuse, why: "two sentences; no partial match"}
+- {text: "play Halo; pause", expect: refuse, why: "semicolon compound"}
+- {text: "play Halo, wait", expect: refuse, why: "comma and correction word"}
+- {text: "play Halo instead", expect: refuse, why: "correction word; C1 exact match fails"}
+- {text: "play Halo actually play Hello", expect: refuse, why: "correction word and second verb"}
+- {text: "Halo actually play Hello", expect: refuse, why: "correction; no leading verb, so nothing parses"}
+- {text: "play Halo and pause", expect: refuse, why: "and plus second verb"}
+- {text: "play Halo & pause", expect: refuse, why: "ampersand compound"}
+- {text: "play Halo then pause", expect: refuse, why: "then compound"}
+- {text: "play Halo + skip", expect: refuse, why: "plus compound"}
+- {text: "pause then play Halo", expect: refuse, why: "then compound with two commands"}
+- {text: "pause and skip", expect: refuse, why: "and compound of two commands"}
+- {text: "play Halo and open Opera", expect: refuse, why: "and plus app verb"}
+- {text: "play Halo by Beyonc\u00e9 and skip", expect: refuse, why: "and plus second verb inside play object"}
+- {text: "play Halo, Beyonc\u00e9", expect: refuse, why: "interior comma is not stripped"}
+- {text: "pause the music. Resume.", expect: refuse, why: "two sentences with two commands"}
+- {text: "don't play Halo", expect: refuse, why: "negation prefix"}
+- {text: "do not pause the music", expect: refuse, why: "negation before verb"}
+- {text: "never skip this song", expect: refuse, why: "negation word never"}
+- {text: "don't pause", expect: refuse, why: "negated pause"}
+- {text: "play Halo not Hello", expect: refuse, why: "negation in object"}
+- {text: "can you play Halo?", expect: admit, capability: play_song, why: "polite request; Whisper end-? stripped (lead 27 Oct)"}
+- {text: "could you pause the music?", expect: admit, capability: pause, why: "polite request; Whisper end-? stripped (lead 27 Oct)"}
+- {text: "Play Halo, please?", expect: admit, capability: play_song, why: "comma before polite suffix allowed; end-? stripped (lead 27 Oct)"}
+- {text: "what does pause mean?", expect: refuse, why: "question about a verb"}
+- {text: "should I pause?", expect: refuse, why: "question"}
+- {text: "is the music paused?", expect: refuse, why: "question about state"}
+- {text: "what happened?", expect: refuse, why: "question; no command"}
+- {text: "he said play Halo", expect: refuse, why: "reported speech"}
+- {text: "she told me to pause the music", expect: refuse, why: "reported speech with told"}
+- {text: "the caller says play Halo", expect: refuse, why: "reported speech with says"}
+- {text: "\"play Halo\"", expect: refuse, why: "quoted speech with double quotes"}
+- {text: "\u201cplay Halo\u201d", expect: refuse, why: "quoted speech with curly double quotes"}
+- {text: "\u2018play Halo\u2019", expect: refuse, why: "quoted speech with curly single quotes"}
+- {text: "`play Halo`", expect: refuse, why: "quoted speech with backticks"}
+- {text: "play 'Halo'", expect: refuse, why: "quoted object with straight single quotes"}
+- {text: "play \u201cHalo\u201d", expect: refuse, why: "quoted object with curly double quotes"}
+- {text: "play \u2018Halo\u2019", expect: refuse, why: "quoted object with curly single quotes"}
+- {text: "play the song", expect: refuse, why: "stopword-only object"}
+- {text: "play the", expect: refuse, why: "stopword-only object"}
+- {text: "pause the", expect: refuse, why: "dangling article; no pause object"}
+- {text: "play Halo, pause", expect: refuse, why: "comma compound"}
+- {text: "Pause, please.", expect: admit, capability: pause, why: "comma before polite suffix allowed (lead 27 Oct)"}
+- {text: "turn it up and play Halo", expect: refuse, why: "and plus play verb"}
+- {text: "play Halo please, thanks, and pause", expect: refuse, why: "polite suffix plus compound"}
+- {text: "set volume to 40 and skip", expect: refuse, why: "and plus next verb"}
+- {text: "turn up the cats", expect: refuse, why: "no parse for music volume with object cats"}
+- {text: "set volume to 40", expect: admit, capability: set_volume, args: {level: 40}, why: "explicit absolute volume"}
+- {text: "set the volume to 40", expect: admit, capability: set_volume, args: {level: 40}, why: "optional the (phase 1 script V1; lead 28 Oct)"}
+- {text: "set the the volume to 40", expect: refuse, why: "doubled article"}
+- {text: "set Windows volume to forty", expect: admit, capability: set_volume, args: {level: 40}, why: "number word in range"}
+- {text: "set volume to forty", expect: admit, capability: set_volume, args: {level: 40}, why: "number word forty"}
+- {text: "volume to 40 percent", expect: admit, capability: set_volume, args: {level: 40}, why: "percent suffix stripped"}
+- {text: "set master volume to 60", expect: admit, capability: set_volume, args: {level: 60}, why: "master qualifier"}
+- {text: "turn it up", expect: admit, capability: change_volume, args: {direction: "up", amount: 0, unit: "points"}, why: "relative default step"}
+- {text: "turn it down", expect: admit, capability: change_volume, args: {direction: "down", amount: 0, unit: "points"}, why: "relative default step"}
+- {text: "make it louder", expect: admit, capability: change_volume, args: {direction: "up", amount: 0, unit: "points"}, why: "louder phrasing"}
+- {text: "make it quieter", expect: admit, capability: change_volume, args: {direction: "down", amount: 0, unit: "points"}, why: "quieter phrasing"}
+- {text: "louder", expect: admit, capability: change_volume, args: {direction: "up", amount: 0, unit: "points"}, why: "bare louder"}
+- {text: "quieter", expect: admit, capability: change_volume, args: {direction: "down", amount: 0, unit: "points"}, why: "bare quieter"}
+- {text: "turn it down 10 percent", expect: admit, capability: change_volume, args: {direction: "down", amount: 10, unit: "percent"}, why: "explicit percent amount"}
+- {text: "turn the volume up 5 points", expect: admit, capability: change_volume, args: {direction: "up", amount: 5, unit: "points"}, why: "explicit point amount"}
+- {text: "set volume to 101", expect: refuse, why: "out of range (above 100)"}
+- {text: "set volume to 150", expect: refuse, why: "out of range (above 100)"}
+- {text: "set volume to negative 5", expect: refuse, why: "negative level out of range"}
+- {text: "turn it up 150 percent", expect: refuse, why: "relative amount out of range"}
+- {text: "turn it down by 10", expect: refuse, why: "word by is not an amount"}
+- {text: "set volume to 40 and mute", expect: refuse, why: "and plus mute; compound"}
+- {text: "set volume to 40 then turn it up", expect: refuse, why: "then compound of two volume commands"}
+- {text: "turn it up, actually down", expect: refuse, why: "correction and comma"}
+- {text: "turn it down, no, up", expect: refuse, why: "correction and comma"}
+- {text: "make it louder, wait", expect: refuse, why: "correction and comma"}
+- {text: "volume up and skip", expect: refuse, why: "and plus next verb"}
+- {text: "open Spotify", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "explicit app open"}
+- {text: "can you open Spotify", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "polite prefix"}
+- {text: "please open Spotify", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "bare please prefix"}
+- {text: "open Spotify please", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "polite suffix"}
+- {text: "launch Spotify", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "launch verb"}
+- {text: "start up Spotify", expect: admit, capability: open_app, args: {name: "Spotify"}, why: "start up verb phrase must beat start play verb (C2)"}
+- {text: "open Opera", expect: admit, capability: open_app, args: {name: "Opera"}, why: "app name, not search verb"}
+- {text: "open the app", expect: refuse, why: "stopword-only object"}
+- {text: "open a browser", expect: refuse, why: "stopword-only object"}
+- {text: "open please", expect: refuse, why: "empty object after polite suffix"}
+- {text: "open Spotify and play Halo", expect: refuse, why: "and plus play verb"}
+- {text: "open Spotify then pause", expect: refuse, why: "then compound"}
+- {text: "open Spotify if I ask", expect: refuse, why: "conditional word"}
+- {text: "open ms-settings:display", expect: refuse, why: "URI with colon; never a command or URI"}
+- {text: "open run.bat", expect: refuse, why: "script filename with period; never a path"}
+- {text: "open https://example.com", expect: refuse, why: "URL; never a URI"}
+- {text: "open C:\\Apps\\run.bat", expect: refuse, why: "path with drive colon and period"}
+- {text: "don't open Spotify", expect: refuse, why: "negation"}
+- {text: "should I open Spotify?", expect: refuse, why: "question"}
+- {text: "search for how to not burn rice", expect: admit, capability: search_browser, args: {query: "how to not burn rice", browser: "Opera"}, why: "search is exempt from C1 negation words"}
+- {text: "search for cats don't bite", expect: admit, capability: search_browser, why: "search exempt from negation (C1 exemption); current grammar may refuse on don't"}
+- {text: "search for actually good ideas", expect: admit, capability: search_browser, args: {query: "actually good ideas", browser: "Opera"}, why: "search exempt from correction words (C1 exemption)"}
+- {text: "search for how to stop smoking", expect: admit, capability: search_browser, why: "stop inside query is exempt"}
+- {text: "search for nextjs tutorial", expect: admit, capability: search_browser, why: "word containing next is not a verb"}
+- {text: "search for playlist ideas", expect: admit, capability: search_browser, why: "word containing play is not a verb"}
+- {text: "search for how to show hidden files", expect: admit, capability: search_browser, why: "show in query without object rule"}
+- {text: "google best pizza in Brooklyn", expect: admit, capability: search_browser, args: {query: "best pizza in Brooklyn", browser: "Opera"}, why: "google verb in Opera"}
+- {text: "look up Halo lyrics", expect: admit, capability: search_browser, args: {query: "Halo lyrics", browser: "Opera"}, why: "look up verb in Opera"}
+- {text: "search Halo", expect: admit, capability: search_browser, args: {query: "Halo", browser: "Opera"}, why: "bare search verb"}
+- {text: "search for show me Halo", expect: admit, capability: search_browser, why: "show me is not a connector-preceded verb"}
+- {text: "search for cats and play music", expect: refuse, why: "and plus play verb; compound"}
+- {text: "search for cats play music", expect: refuse, why: "other mutating verb inside query; adapter refuses"}
+- {text: "search for rice then pause", expect: refuse, why: "then compound and pause verb"}
+- {text: "search for music next", expect: refuse, why: "next verb inside query"}
+- {text: "search for volume up", expect: refuse, why: "volume verb inside query"}
+- {text: "search for open the file", expect: refuse, why: "open verb inside query"}
+- {text: "search for start a jam", expect: refuse, why: "start verb inside query"}
+- {text: "search for cats and ask codex to fix it", expect: refuse, why: "codex verb inside query"}
+- {text: "search for tell codex to x", expect: refuse, why: "codex verb inside query"}
+- {text: "search for get codex to run", expect: refuse, why: "codex verb inside query"}
+- {text: "search for have codex fix it", expect: refuse, why: "codex verb inside query"}
+- {text: "search for send codex the log", expect: refuse, why: "codex verb inside query"}
+- {text: "search for give codex the log", expect: refuse, why: "codex verb inside query"}
+- {text: "search for show me the song halo", expect: refuse, why: "show-song verb inside query"}
+- {text: "search for show the album halo", expect: refuse, why: "show-album verb inside query"}
+- {text: "search for show me the album x", expect: refuse, why: "show-album verb inside query"}
+- {text: "search for cats, resume", expect: refuse, why: "comma and resume verb"}
+- {text: "search for turn up the cats", expect: refuse, why: "turn up volume verb inside query"}
+- {text: "search for cats and skip", expect: refuse, why: "and plus skip verb"}
+- {text: "google a browser", expect: refuse, why: "stopword-only object"}
+- {text: "search for please", expect: refuse, why: "empty object after polite suffix"}
+- {text: "search for", expect: refuse, why: "empty object"}
+- {text: "show Halo", expect: admit, capability: show_track, args: {query: "Halo"}, why: "show track without playing"}
+- {text: "show me Halo", expect: admit, capability: show_track, args: {query: "Halo"}, why: "show me track verb"}
+- {text: "show the song Halo", expect: admit, capability: show_track, args: {query: "Halo"}, why: "explicit show song"}
+- {text: "show me the song Halo", expect: admit, capability: show_track, args: {query: "Halo"}, why: "explicit show song with me"}
+- {text: "show me the album Lover", expect: admit, capability: show_album, args: {query: "Lover"}, why: "show me the album beats show me (C2)"}
+- {text: "show the album Lover", expect: admit, capability: show_album, args: {query: "Lover"}, why: "explicit show album"}
+- {text: "show me the album halo", expect: admit, capability: show_album, why: "album object belongs to show_album (C2)"}
+- {text: "can you show me the song Halo?", expect: admit, capability: show_track, why: "polite request; end-? stripped (lead 27 Oct)"}
+- {text: "show album Lover", expect: refuse, why: "no verb phrase for show album; album belongs to show_album only"}
+- {text: "show Halo and play it", expect: refuse, why: "and plus play verb"}
+- {text: "show Halo then pause", expect: refuse, why: "then compound"}
+- {text: "show the album Lover, and skip", expect: refuse, why: "comma and and-compound"}
+- {text: "show the album", expect: refuse, why: "empty object"}
+- {text: "show the song", expect: refuse, why: "empty object"}
+- {text: "start a jam", expect: admit, capability: start_jam, args: {}, why: "start jam takes no object"}
+- {text: "start jam", expect: admit, capability: start_jam, args: {}, why: "start jam without article"}
+- {text: "show the jam code", expect: admit, capability: start_jam, args: {}, why: "show jam code verb phrase"}
+- {text: "show the jam qr", expect: admit, capability: start_jam, args: {}, why: "show jam qr verb phrase"}
+- {text: "could you start a jam", expect: admit, capability: start_jam, args: {}, why: "polite prefix"}
+- {text: "start a jam please", expect: admit, capability: start_jam, args: {}, why: "polite suffix"}
+- {text: "start a jam and play Halo", expect: refuse, why: "and plus play verb"}
+- {text: "start a jam then pause", expect: refuse, why: "then compound"}
+- {text: "start a jam later", expect: refuse, why: "jam takes no object; leftover word"}
+- {text: "start a jam?", expect: admit, capability: start_jam, why: "end-? stripped; not Codex (lead 27 Oct)"}
+- {text: "don't start a jam", expect: refuse, why: "negation"}
+- {text: "should I start a jam", expect: refuse, why: "question form"}
+- {text: "start a jam with Halo", expect: refuse, why: "jam takes no object"}
+- {text: "show the jam code, please", expect: admit, capability: start_jam, why: "comma before polite suffix allowed (lead 27 Oct)"}
+- {text: "he said start a jam", expect: refuse, why: "reported speech"}
+- {text: "start a jam if I ask", expect: refuse, why: "conditional word"}
+- {text: "start a jam, wait", expect: refuse, why: "comma and correction"}
+- {text: "ask codex to fix the login bug", expect: admit, capability: codex_request, args: {request: "fix the login bug"}, why: "ask codex to verb with object of at least 3 words"}
+- {text: "tell codex to repair the broken tests", expect: admit, capability: codex_request, args: {request: "repair the broken tests"}, why: "tell codex to verb"}
+- {text: "get codex to refactor the parser code", expect: admit, capability: codex_request, args: {request: "refactor the parser code"}, why: "get codex to verb"}
+- {text: "have codex inspect the application logs", expect: admit, capability: codex_request, args: {request: "inspect the application logs"}, why: "have codex verb"}
+- {text: "send codex investigate the failing build", expect: admit, capability: codex_request, args: {request: "investigate the failing build"}, why: "send codex verb"}
+- {text: "give codex review the database migration", expect: admit, capability: codex_request, args: {request: "review the database migration"}, why: "give codex verb"}
+- {text: "can you ask codex to fix the login bug", expect: admit, capability: codex_request, args: {request: "fix the login bug"}, why: "polite prefix"}
+- {text: "Ask Codex to fix the tests, but don't send it yet", expect: refuse, why: "revocation and comma"}
+- {text: "Ask Codex to fix the tests? What does that mean?", expect: refuse, why: "question suffix"}
+- {text: "\"ask codex to fix the tests\"", expect: refuse, why: "quoted speech"}
+- {text: "he said ask codex to fix the tests", expect: refuse, why: "reported speech"}
+- {text: "ask codex to fix the tests later", expect: refuse, why: "delayed hedge"}
+- {text: "ask codex to fix the tests not yet", expect: refuse, why: "not yet revocation"}
+- {text: "ask codex to fix the tests wait", expect: refuse, why: "wait revocation"}
+- {text: "ask codex to fix the tests hold on", expect: refuse, why: "hold on revocation"}
+- {text: "ask codex to fix the tests never mind", expect: refuse, why: "never mind revocation"}
+- {text: "ask codex to fix the tests or not", expect: refuse, why: "or not hedge"}
+- {text: "ask codex to maybe fix the tests", expect: refuse, why: "maybe hedge"}
+- {text: "ask codex to fix the tests should I", expect: refuse, why: "should I hedge"}
+- {text: "ask codex to fix the tests what is this", expect: refuse, why: "what is question suffix"}
+- {text: "ask codex to fix the tests can you explain", expect: refuse, why: "explain suffix"}
+- {text: "ask codex to fix the tests just kidding", expect: refuse, why: "revocation just kidding"}
+- {text: "ask codex to fix the tests cancel", expect: refuse, why: "cancel revocation"}
+- {text: "ask codex to do not send this", expect: refuse, why: "negation in request"}
+- {text: "ask codex to fix this?", expect: refuse, why: "question mark in request"}
+- {text: "ask codex to fix tests", expect: refuse, why: "fewer than three words"}
+- {text: "ask codex to fix the tests if I ask", expect: refuse, why: "conditional hedge"}
+- {text: "ask codex to fix the tests unless I stop", expect: refuse, why: "conditional hedge"}
+- {text: "ask codex to fix the tests; then stop", expect: refuse, why: "semicolon and then"}
+- {text: "ask codex to fix it", expect: refuse, why: "fewer than three words"}
+- {text: "send codex the log", expect: refuse, why: "fewer than three words"}
+- {text: "codex, refactor the parser", expect: refuse, why: "comma form dropped on 27 Oct"}
+- {text: "what did codex say", expect: refuse, why: "question about codex, not a request"}
+- {text: "is codex done?", expect: refuse, why: "question about codex"}
+- {text: "tell me about codex", expect: refuse, why: "not a delegation verb phrase"}
+- {text: "ask codex to fix the login bug and open Spotify", expect: refuse, why: "and plus app verb in codex request"}
+- {text: "ask codex to fix the login bug, then play Halo", expect: refuse, why: "comma and then compound"}
+- {text: "ask codex to fix the login bug. Then pause.", expect: refuse, why: "two sentences"}
+- {text: "Halo", expect: refuse, why: "no verb phrase"}
+- {text: "", expect: refuse, why: "empty utterance"}
+- {text: "   ", expect: refuse, why: "whitespace-only utterance"}
+- {text: "play Halo\u0000", expect: refuse, why: "control character"}
+
+- {text: "ask codex to fix the login bug forget it", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug forget that", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug scratch that", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug ignore that", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug disregard that", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug just joking", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug only joking", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug joking", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug kidding", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug no wait", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug nevermind", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug for example", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug for instance", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug hypothetically", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug imagine", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug pretend", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug suppose", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug lets say", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug let us say", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug someday", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug eventually", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug sometime", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug tomorrow", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug tonight", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug next week", expect: refuse, why: "revocation or hypothetical"}
+- {text: "ask codex to fix the login bug in the settings page", expect: admit, capability: codex_request, args: {request: "fix the login bug in the settings page"}, why: "specific direct request"}
+
+- {"text": "ask codex to fix the tests i", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests im", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests i'm", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests ive", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests i've", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests id", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests i'd", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests i'll", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests ill", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests joke", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests joking", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests jest", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests example", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests sample", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests take that back", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests take it back", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests take back", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests retract", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests not serious", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests seriously", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests kidding", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests that was", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests it was", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests was just", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests I take that back", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests that was a joke", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests was just an example", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix the tests I introduced", "expect": "refuse", "why": "first-person subject or withdrawal/example form"}
+- {"text": "ask codex to fix my login page", "expect": "admit", "capability": "codex_request", "args": {"request": "fix my login page"}, "why": "possessive my remains allowed"}

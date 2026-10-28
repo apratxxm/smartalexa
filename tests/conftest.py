@@ -1,5 +1,22 @@
 """Keep tests independent of the developer's real local track index."""
+import logging
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_memoir_logger():
+    logger = logging.getLogger("memoir")
+    handlers = logger.handlers[:]
+    level, propagate, disabled = logger.level, logger.propagate, logger.disabled
+    yield
+    for handler in logger.handlers:
+        if handler not in handlers:
+            handler.close()
+    logger.handlers = handlers
+    logger.setLevel(level)
+    logger.propagate = propagate
+    logger.disabled = disabled
 
 
 @pytest.fixture(autouse=True)
