@@ -15,6 +15,12 @@ Updated 2026-10-27. Read on resume; material updates only. Plan of record: [STRA
 - **Wake:** bench + recorder; synthetic candidate `models/wake/candidates/20261027-synthtts-lessac/alexa_synth.onnx` (provisional; synthetic held-out recall 0.944 vs stock 0.778 @0.5). Not wired.
 - **Cutover map** `docs/research/CUTOVER_MAP.md` (re-run before phase 5; `.env` excluded from the backup).
 
+## Live native evidence (28–29 Oct, typed text in place of speech + grammar stand-in for the brain; real Spotify/Opera/Codex)
+- Phase 1: pause, Windows volume set/up/down, both negatives OK. Play/resume/next were unconfirmed: the Spotify desktop app accepts Web API "play track" but doesn't play; fixed (local track starts go through the spotify: link). Not yet re-verified live.
+- Phase 1b: artist, previous, restart track/album, pause observed; album fixed and seen playing directly; queue stays "requested" (no read-back); playlist hit the local request budget.
+- Phase 3: open Spotify, Opera search, show song/album observed; Calculator unconfirmed (identity now resolves to its install folder, not re-verified). Codex: request delivered and executed in A:\pisha\codex-scratch in 15 s; "observed" needs the Codex window open.
+- Live runs need a slot when the user is away from the PC (they listen to Spotify on it).
+
 ## Waiting on the user
 
 1. Free keys (`CF_ACCOUNT_ID`, `CF_API_TOKEN`, optional `GROQ_API_KEY`) → `python -m assistant.core --eval`.
