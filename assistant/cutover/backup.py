@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import os
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -18,20 +20,25 @@ except ModuleNotFoundError:
 MANIFEST = ".cutover-manifest.json"
 
 
-def _excluded(name: str) -> bool:
+def _exclusion(name: str, root=None):
     parts = PurePosixPath(name).parts
     for index, part in enumerate(parts):
         part = part.lower()
-        if part == ".env.example":
-            continue
-        if (part == ".env" or part.startswith(".env.") or part.startswith(".venv")
-                or part in {".git", "__pycache__", ".pytest_cache"}
-                or part.endswith((".pyc", ".pem", ".key"))
-                or "token" in part or "secret" in part):
-            return True
+        if part.startswith(".env") and part != ".env.example":
+            return "environment"
+        if part in {".git", "__pycache__", ".pytest_cache", ".cache"} or part.startswith((".spotify_cache", ".cache-")):
+            return "metadata or cache"
+        if part.endswith((".pyc", ".log", ".pem", ".key")) or fnmatch.fnmatchcase(part, "credentials*.json") or fnmatch.fnmatchcase(part, "*token*.json"):
+            return "generated or credential file"
+        if part.startswith(".venv") or (part in {"venv", "env"} and root is not None and (root.joinpath(*parts[:index + 1]) / "pyvenv.cfg").is_file()):
+            return "virtual environment"
         if index == 1 and parts[0].lower() == "assistant" and part == "logs":
-            return True
-    return False
+            return "assistant logs"
+    return None
+
+
+def _excluded(name: str) -> bool:
+    return bool(_exclusion(name))
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -53,38 +60,58 @@ def make_backup(root, dest_zip, *, manifest_path):
         raise FileExistsError("Archive or manifest already exists")
     manifest = {"created_at": datetime.now(timezone.utc).isoformat(),
                 "source_root": str(root), "git_head": _git(root, "rev-parse", "HEAD"),
-                "git_status_porcelain": _git(root, "status", "--porcelain"), "files": {}}
+                "git_status_porcelain": _git(root, "status", "--porcelain"), "files": {}, "excluded": {}}
+    inventory = set()
+    for arguments in (("ls-files", "-z"), ("ls-files", "-z", "--others", "--exclude-standard")):
+        output = subprocess.check_output(["git", "-C", str(root), *arguments])
+        inventory.update(os.fsdecode(path).replace("\\", "/") for path in output.split(b"\0") if path)
     created_archive = False
     try:
         raw = dest.open("xb")
         created_archive = True
         with raw, zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as archive:
-            for directory, dirs, files in os.walk(root, followlinks=False):
+            def walk_error(error):
+                raise error
+            for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
                 base = Path(directory)
                 for name in list(dirs):
                     path = base / name
                     relative = path.relative_to(root).as_posix()
-                    if _excluded(relative):
+                    reason = _exclusion(relative, root)
+                    if reason:
                         print(f"Excluded: {relative}/")
+                        manifest["excluded"][relative + "/"] = reason
                         dirs.remove(name)
                     elif path.is_symlink():
                         raise ValueError(f"Symlink not supported: {relative}")
                 for name in files:
                     path = base / name
                     relative = path.relative_to(root).as_posix()
-                    if _excluded(relative):
+                    reason = _exclusion(relative, root)
+                    if reason:
                         print(f"Excluded: {relative}")
+                        manifest["excluded"][relative] = reason
                         continue
                     if relative == MANIFEST or path.is_symlink():
                         raise ValueError(f"Unsupported source entry: {relative}")
                     digest = hashlib.sha256()
                     size = 0
+                    before = path.stat()
                     with path.open("rb") as source, archive.open(relative, "w") as target:
                         while chunk := source.read(1024 * 1024):
                             digest.update(chunk)
                             size += len(chunk)
                             target.write(chunk)
+                    after = path.stat()
+                    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                        raise ValueError(f"Source changed during backup: {relative}")
                     manifest["files"][relative] = {"sha256": digest.hexdigest(), "size": size}
+            for name in inventory:
+                if name not in manifest["files"]:
+                    reason = _exclusion(name, root)
+                    if not reason:
+                        raise ValueError(f"Inventory path not archived: {name}")
+                    manifest["excluded"][name] = reason
             archive.writestr(MANIFEST, json.dumps(manifest, indent=2).encode("utf-8"))
         with manifest_file.open("x", encoding="utf-8") as output:
             json.dump(manifest, output, indent=2)
@@ -105,6 +132,11 @@ def _validate(archive, manifest):
     expected = manifest["files"]
     if set(names) != set(expected) | {MANIFEST}:
         raise ValueError("Archive entries differ from manifest")
+    for name in names:
+        parts = PurePosixPath(name).parts
+        for index, part in enumerate(parts):
+            if part.lower() in {"env", "venv"} and "/".join(parts[:index + 1] + ("pyvenv.cfg",)) in names:
+                raise ValueError(f"Excluded virtual environment: {name}")
     for entry in entries:
         name = entry.filename
         if name == MANIFEST:
@@ -133,21 +165,31 @@ def verify_backup(zip_path, manifest_path):
     return True
 
 
-def restore_to(zip_path, scratch_dir):
-    scratch = Path(scratch_dir).resolve(strict=True)
-    if not scratch.is_dir() or any(scratch.iterdir()):
-        raise ValueError("Restore destination must be an existing empty directory")
+def restore_to(zip_path, manifest_path, source_root, scratch_parent):
+    parent = Path(scratch_parent).resolve(strict=True)
+    live = Path(source_root).resolve(strict=True)
+    if not parent.is_dir():
+        raise ValueError("Restore parent must be a directory")
+    with Path(manifest_path).open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if Path(manifest["source_root"]).resolve() != live:
+        raise ValueError("Source root differs from manifest")
+    tool_root = Path(__file__).resolve().parents[2]
+    if _inside(parent, live) or _inside(parent, tool_root):
+        raise ValueError("Restore destination overlaps the live root")
     with zipfile.ZipFile(zip_path) as archive:
-        manifest = json.loads(archive.read(MANIFEST))
-        live = Path(manifest["source_root"]).resolve()
-        tool_root = Path(__file__).resolve().parents[2]
-        if (_inside(scratch, live) or _inside(live, scratch)
-                or _inside(scratch, tool_root) or _inside(tool_root, scratch)):
-            raise ValueError("Restore destination overlaps the live root")
         _validate(archive, manifest)
+        scratch = Path(tempfile.mkdtemp(prefix="cutover-restore-", dir=parent))
         for name, expected in manifest["files"].items():
             destination = scratch.joinpath(*PurePosixPath(name).parts)
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            current = scratch
+            for component in PurePosixPath(name).parts[:-1]:
+                current = current / component
+                if not current.exists() and not current.is_symlink():
+                    current.mkdir()
+                details = os.lstat(current)
+                if stat.S_ISLNK(details.st_mode) or getattr(details, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+                    raise ValueError(f"Reparse point in restore path: {current}")
             digest = hashlib.sha256()
             size = 0
             with archive.open(name) as source, destination.open("xb") as output:
@@ -157,10 +199,11 @@ def restore_to(zip_path, scratch_dir):
                     size += len(chunk)
             if expected != {"sha256": digest.hexdigest(), "size": size}:
                 raise ValueError(f"Restored file mismatch: {name}")
-    return manifest
+    return scratch
 
 
 def legacy_startup_check(restored_root, python, *, live_root=None):
+    """Check imports and prerequisites, not actual assistant startup."""
     restored = Path(restored_root).resolve(strict=True)
     live = Path(live_root).resolve(strict=True) if live_root else Path(__file__).resolve().parents[2]
     with (restored / "assistant" / "config.toml").open("rb") as source:
@@ -216,5 +259,10 @@ print(json.dumps(result))
     except (ValueError, IndexError):
         result = {"imports_ok": False, "error": "Probe returned no valid result"}
     result.update({"returncode": completed.returncode, "env_exists": (live / ".env").is_file(),
-                   "model_assets": assets, "scope": "mocked imports and resolver; not a live startup"})
+                   "model_assets": assets, "scope": "import-level check; not a live startup"})
+    result["unverified"] = [name for name, item in assets.items() if item["status"] == "named_model_unverified"]
+    result["ok"] = (completed.returncode == 0 and result.get("imports_ok") is True
+                    and result.get("runtime_module") == "assistant.main" and result["env_exists"]
+                    and bool(result.get("packages")) and all(value is True for value in result["packages"].values())
+                    and all(item["status"] not in {"missing", "missing_config"} for item in assets.values()))
     return result
