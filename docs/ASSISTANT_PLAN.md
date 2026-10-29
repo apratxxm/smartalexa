@@ -16,9 +16,9 @@ Updated 2026-10-27. Read on resume; material updates only. Plan of record: [STRA
 - **Cutover map** `docs/research/CUTOVER_MAP.md` (re-run before phase 5; `.env` excluded from the backup).
 
 ## Live native evidence (28–29 Oct, typed text in place of speech + grammar stand-in for the brain; real Spotify/Opera/Codex)
-- Phase 1: pause, Windows volume set/up/down, both negatives OK. Play/resume/next were unconfirmed: the Spotify desktop app accepts Web API "play track" but doesn't play; fixed (local track starts go through the spotify: link). Not yet re-verified live.
+- Phase 1 (29 Oct rerun): 9/9 observed (play Halo, pause, resume, next, pause/resume the music, volume set/up/down), both negatives refused.
 - Phase 1b: artist, previous, restart track/album, pause observed; album fixed and seen playing directly; queue stays "requested" (no read-back); playlist hit the local request budget.
-- Phase 3: open Spotify, Opera search, show song/album observed; Calculator unconfirmed (identity now resolves to its install folder, not re-verified). Codex: request delivered and executed in A:\pisha\codex-scratch in 15 s; "observed" needs the Codex window open.
+- Phase 3 (29 Oct rerun): 5/5 observed (Calculator via UWP CoreWindow identity, Spotify via install path, Opera search, show song/album). Codex: request delivered and executed in A:\pisha\codex-scratch in 15 s; "observed" needs the Codex window open.
 - Live runs need a slot when the user is away from the PC (they listen to Spotify on it).
 
 ## Waiting on the user

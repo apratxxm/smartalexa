@@ -618,3 +618,13 @@ def test_spotify_package_path_accepts_runtime_executable_not_manifest_stub():
         desk.foreground = window
     desk = Desktop(on_spawn=launch)
     assert open_handler(desk, catalog=(entry,)).execute({"name": "Spotify"}, Guard()).state == "observed"
+
+def test_spotify_titled_with_playing_song_is_observed_by_install_path():
+    # Live 29 Oct: Spotify's title was "Steve Lacy - Some", so a title rule never matched.
+    entry = AppEntry("Spotify", SPOTIFY_ID, "packaged", r"C:\Packages\Spotify")
+    window = observe.Window(92, 192, "spotify.exe", "Steve Lacy - Some", r"C:\Packages\Spotify\Spotify.exe")
+    def launch(desk):
+        desk.windows.append(window)
+        desk.foreground = window
+    desk = Desktop(on_spawn=launch)
+    assert open_handler(desk, catalog=(entry,)).execute({"name": "Spotify"}, Guard()).state == "observed"

@@ -56,6 +56,8 @@ def _win32():
     kernel32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowExW.restype = wintypes.HWND
     _win32_cache = (ctypes, wintypes, user32, kernel32, enum_proc)
     return _win32_cache
 
@@ -64,6 +66,14 @@ def _describe(hwnd: int) -> Window:
     ctypes, wintypes, user32, kernel32, _ = _win32()
     pid = wintypes.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    # Modern (UWP) apps draw inside ApplicationFrameHost; the app itself owns the child
+    # CoreWindow. Report that process so identity checks see e.g. CalculatorApp.exe.
+    core = user32.FindWindowExW(hwnd, None, "Windows.UI.Core.CoreWindow", None)
+    if core:
+        inner = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(core, ctypes.byref(inner))
+        if inner.value and inner.value != pid.value:
+            pid = inner
     image = ""
     image_path = ""
     handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION

@@ -370,8 +370,7 @@ class OpenApp(_Base):
             return Receipt("unknown", "dispatch_uncertain", content=entry.label, error=type(exc).__name__)
         label = entry.label
         def match(window):
-            if not _has_phrase(window.title, _key(label)):
-                return False
+            # Process identity is the proof (C3). Titles aren't: Spotify's title is the playing song.
             if entry.kind == "exe":
                 return window.image.casefold() == ntpath.basename(entry.target).casefold()
             location = entry.image
