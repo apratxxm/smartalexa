@@ -42,8 +42,9 @@ api_key_env = "GROQ_API_KEY"
 max_seconds = 8
 
 [core.codex]
-# Empty until bridge sandbox and deadline guarantees are implemented.
-project_dir = ""
+# Scratch folder for the phase 3 Codex trials (lead 28 Oct; sandbox ceiling and deadline
+# guards are in place). Point it at a real project when you choose one. Phase 3 stays off.
+project_dir = 'A:\pisha\codex-scratch'
 
 [audio]
 # NEVER "default": Windows can silently route input from the Bluetooth speaker's

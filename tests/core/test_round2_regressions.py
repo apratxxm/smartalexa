@@ -179,9 +179,14 @@ def test_f3_native_play_then_metadata_loss_never_pauses_or_opens_a_uri(monkeypat
     spotify.resolve_track = lambda query: Candidate("spotify:track:halo", "Halo", "Beyonce")
     def deferred(**kwargs):
         raise SpotifyRequestDeferred("proven local budget refusal")
-    spotify.sp = SimpleNamespace(start_playback=deferred)
-    result = Executor(spotify).execute(Step("s", "play_song", {"title": "Halo", "artist": "Beyonce"}))
-    assert result.state == "unknown" and result.error == "PlaybackVerificationError"
+    import socket
+    spotify.sp = SimpleNamespace(start_playback=deferred, devices=lambda: {"devices": [
+        {"id": "pinned", "name": socket.gethostname(), "type": "Computer"}]})
+    from assistant.core.playback import guarded_playback
+    from assistant.spotify import PlaybackVerificationError
+    with guarded_playback(spotify, lambda: 5):
+        with pytest.raises(PlaybackVerificationError):
+            spotify._play_uri_locally(Candidate("spotify:track:halo", "Halo", "Beyonce"))
     assert events == ["native_play_dispatched"]
 
 

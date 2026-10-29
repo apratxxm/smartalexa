@@ -18,6 +18,7 @@ class Window:
     pid: int
     image: str   # lowercase executable file name, "" when unreadable
     title: str
+    image_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -64,19 +65,21 @@ def _describe(hwnd: int) -> Window:
     pid = wintypes.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     image = ""
+    image_path = ""
     handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
     if handle:
         try:
             size = wintypes.DWORD(1024)
             buffer = ctypes.create_unicode_buffer(1024)
             if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                image = buffer.value.rsplit("\\", 1)[-1].casefold()
+                image_path = buffer.value
+                image = image_path.rsplit("\\", 1)[-1].casefold()
         finally:
             kernel32.CloseHandle(handle)
     length = user32.GetWindowTextLengthW(hwnd)
     text = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, text, length + 1)
-    return Window(int(hwnd or 0), int(pid.value), image, text.value)
+    return Window(int(hwnd or 0), int(pid.value), image, text.value, image_path)
 
 
 def enumerate_windows() -> list[Window]:
@@ -113,13 +116,13 @@ class Observer:
                  foreground_window: Callable[[], Window | None] = foreground_window,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 poll: float = 0.25, max_wait: float = 8.0):
+                 poll: float = 0.25, max_wait: float = 6.0):
         self._enumerate = enumerate_windows
         self._foreground = foreground_window
         self._clock = clock
         self._sleep = sleep
         self._poll = poll
-        self._max_wait = max_wait
+        self._max_wait = min(max_wait, 6.0)
 
     def snapshot(self) -> Snapshot:
         windows = tuple(self._enumerate())

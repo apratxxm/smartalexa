@@ -1,6 +1,7 @@
 ﻿"""Per-turn guard hooks around retained Spotify mutation and wait boundaries."""
 from contextlib import contextmanager
 import threading
+import time
 from types import SimpleNamespace
 from ..spotify import Spotify, _RateLimitGuard, PlaybackVerificationError, _matches_local_candidate, open_external_target
 
@@ -37,6 +38,11 @@ def guarded_playback(spotify, guard):
     if session is not None:
         def bounded_send(request, **kwargs):
             budget = remaining(guard)
+            deadline = getattr(spotify, "_idle_uri_deadline", None)
+            if deadline is not None:
+                budget = min(budget, deadline - time.monotonic())
+                if budget <= 0:
+                    raise TurnExpired("Idle playback verification deadline expired")
             timeout = kwargs.get("timeout")
             kwargs["timeout"] = (tuple(min(v or budget, budget) for v in timeout)
                                  if isinstance(timeout, tuple) else min(timeout or budget, budget))
@@ -122,6 +128,21 @@ def guarded_playback(spotify, guard):
             threading.Thread(target=window.return_focus, daemon=True).start()
             return bool(spotify._now_playing(candidate, timeout=8.0))
 
+    def open_idle_uri(uri):
+        remaining(guard)
+        open_external_target(uri)
+
+    def idle_budget():
+        budget = remaining(guard)
+        deadline = getattr(spotify, "_idle_uri_deadline", None)
+        if deadline is not None:
+            budget = min(budget, deadline - time.monotonic())
+            if budget <= 0:
+                raise TurnExpired("Idle playback verification deadline expired")
+        return budget
+
+    replace("_idle_uri_budget", idle_budget)
+    replace("_open_idle_uri", open_idle_uri)
     replace("_call", call)
     replace("_local", local)
     replace("_play_uri_locally", desktop)

@@ -20,7 +20,7 @@ OPERA = Path("C:/Users/test/AppData/Local/Programs/Opera GX/opera.exe")
 EXPLORER = Path("C:/Windows/explorer.exe")
 SPOTIFY_ID = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"
 PACKAGED = (
-    AppEntry("Spotify", SPOTIFY_ID, "packaged"),
+    AppEntry("Spotify", SPOTIFY_ID, "packaged", "C:\\Packages\\Spotify"),
     AppEntry("Don't Stop", "Vendor.Player!DontStop", "packaged"),
 )
 EDITOR = "C:\\Apps\\editor.exe"
@@ -53,7 +53,8 @@ class Guard:
 
 
 def win(hwnd, image, title):
-    return observe.Window(hwnd, 100 + hwnd, image, title)
+    path = "C:\\Packages\\Spotify\\spotify.exe" if image.casefold() == "spotify.exe" else ""
+    return observe.Window(hwnd, 100 + hwnd, image, title, path)
 
 
 class Desktop:
@@ -527,3 +528,93 @@ def test_matching_new_opera_background_is_requested():
     desk = Desktop(foreground=win(20, "explorer.exe", "Desktop"),
                    on_spawn=lambda d: d.windows.append(win(31, "opera.exe", "python tutorials - Google Search")))
     assert search_handler(desk).execute({"query": "python tutorials", "browser": "Opera"}, Guard()).state == "requested"
+
+
+def test_catalogue_warming_then_ready_launches():
+    clock = Clock()
+    desk = Desktop()
+    def catalog():
+        return CLASSIC if clock.now >= 0.1 else ()
+    handler = adapter_mod.OpenApp(catalog=catalog, explorer=lambda: EXPLORER,
+                                 isfile=lambda p: p in EXISTING, observer=observer_for(desk),
+                                 popen=desk.popen, clock=clock, sleep=clock.sleep)
+    assert handler.execute({"name": "Editor"}, Guard()).state == "requested"
+    assert len(desk.spawned) == 1
+
+
+def test_catalogue_still_warming_stops_at_budget():
+    clock = Clock()
+    desk = Desktop()
+    handler = adapter_mod.OpenApp(catalog=lambda: (), observer=observer_for(desk),
+                                 popen=desk.popen, clock=clock, sleep=clock.sleep)
+    receipt = handler.execute({"name": "Editor"}, Guard(budget=0.2))
+    assert receipt.detail == "catalogue_warming"
+    assert clock.now == pytest.approx(0.2)
+    assert not desk.spawned
+
+
+def test_packaged_calculator_uses_resolved_executable():
+    entry = AppEntry("Calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "packaged", "C:\\Packages\\Calculator")
+    window = observe.Window(91, 191, "CALCULATORAPP.EXE", "Calculator", "C:\\Packages\\Calculator\\CalculatorApp.exe")
+    def launch(desk):
+        desk.windows.append(window)
+        desk.foreground = window
+    desk = Desktop(on_spawn=launch)
+    assert open_handler(desk, catalog=(entry,)).execute({"name": "Calculator"}, Guard()).state == "observed"
+
+
+def test_packaged_unknown_identity_is_requested():
+    entry = AppEntry("Calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "packaged")
+    window = win(91, "calculatorapp.exe", "Calculator")
+    def launch(desk):
+        desk.windows.append(window)
+        desk.foreground = window
+    desk = Desktop(on_spawn=launch)
+    assert open_handler(desk, catalog=(entry,)).execute({"name": "Calculator"}, Guard()).state == "requested"
+
+
+def test_delayed_opera_foreground_is_observed_within_budget():
+    clock = Clock()
+    desk = Desktop(foreground=win(20, "explorer.exe", "Desktop"))
+    before = observer_for(desk, clock).snapshot()
+    window = win(31, "opera.exe", "cats - Google Search")
+    def sleep(seconds):
+        clock.sleep(seconds)
+        if clock.now >= 4:
+            desk.windows = [window]
+            desk.foreground = window
+    observer = observe.Observer(enumerate_windows=desk.enumerate, foreground_window=desk.foreground_window,
+                               clock=clock, sleep=sleep, poll=0.25)
+    assert observer.wait_for(before, lambda item: item.image == "opera.exe" and "cats" in item.title, Guard(5)) == window
+    assert clock.now == 4
+
+
+def test_observation_limit_is_six_seconds_or_remaining_budget():
+    for budget, maximum in [(20, 6), (1.5, 1.5)]:
+        clock = Clock()
+        desk = Desktop()
+        observer = observe.Observer(enumerate_windows=desk.enumerate, foreground_window=desk.foreground_window,
+                                   clock=clock, sleep=clock.sleep, max_wait=50)
+        assert observer.wait_for(observer.snapshot(), lambda item: True, Guard(budget)) is None
+        assert clock.now == pytest.approx(maximum)
+
+
+@pytest.mark.parametrize("path", [r"C:\Packages\CalculatorEvil\CalculatorApp.exe", r"C:\Packages\Calculator\..\Other\CalculatorApp.exe", ""])
+def test_package_path_outside_install_location_is_requested(path):
+    entry = AppEntry("Calculator", "Family!App", "packaged", r"C:\Packages\Calculator")
+    window = observe.Window(90, 190, "calculatorapp.exe", "Calculator", path)
+    def launch(desk):
+        desk.windows.append(window)
+        desk.foreground = window
+    desk = Desktop(on_spawn=launch)
+    assert open_handler(desk, catalog=(entry,)).execute({"name": "Calculator"}, Guard()).state == "requested"
+
+
+def test_spotify_package_path_accepts_runtime_executable_not_manifest_stub():
+    entry = AppEntry("Spotify", SPOTIFY_ID, "packaged", r"C:\Packages\Spotify")
+    window = observe.Window(91, 191, "spotify.exe", "Spotify Premium", r"c:\packages\SPOTIFY\spotify.exe")
+    def launch(desk):
+        desk.windows.append(window)
+        desk.foreground = window
+    desk = Desktop(on_spawn=launch)
+    assert open_handler(desk, catalog=(entry,)).execute({"name": "Spotify"}, Guard()).state == "observed"

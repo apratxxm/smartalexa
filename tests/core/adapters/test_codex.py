@@ -227,3 +227,78 @@ def test_sandbox_default_ceiling(tmp_path, contents, allowed):
 def test_effect_words_do_not_block_codex_name():
     assert "codex" not in handler.effect_words
     assert {"submitted", "forwarded", "sent", "asked", "delegated", "started"} <= set(handler.effect_words)
+
+
+def _window_fakes(monkeypatch, foregrounds, *, minimized=False):
+    import ctypes
+    from types import SimpleNamespace
+
+    calls = []
+    class FakeFunction:
+        def __init__(self, name, result=None):
+            self.name, self.result = name, result
+
+        def __call__(self, *args):
+            calls.append((self.name, *args))
+            return self.result
+
+    user32 = SimpleNamespace(
+        IsIconic=FakeFunction("is_iconic", minimized),
+        ShowWindow=FakeFunction("show"),
+        SetForegroundWindow=FakeFunction("focus"),
+        keybd_event=FakeFunction("key"),
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: user32, raising=False)
+    monkeypatch.setattr(codex_module.observe, "enumerate_windows", lambda: [SimpleNamespace(hwnd=42, image="Codex.exe")])
+    snapshots = iter(foregrounds)
+    monkeypatch.setattr(codex_module.observe, "foreground_window", lambda: next(snapshots))
+    return calls
+
+
+def test_raise_codex_retries_once_after_alt_tap(monkeypatch):
+    from types import SimpleNamespace
+    target = SimpleNamespace(hwnd=42, image="Codex.exe")
+    calls = _window_fakes(monkeypatch, [None, target], minimized=True)
+    assert codex_module._raise_codex_window(lambda: 1)
+    assert calls == [("is_iconic", 42), ("show", 42, 9), ("focus", 42),
+                     ("key", 0x12, 0, 0, 0), ("key", 0x12, 0, 2, 0), ("focus", 42)]
+
+
+def test_raise_codex_does_not_retry_after_observed_foreground(monkeypatch):
+    from types import SimpleNamespace
+    calls = _window_fakes(monkeypatch, [SimpleNamespace(hwnd=42, image="codex.exe")])
+    assert codex_module._raise_codex_window(lambda: 1)
+    assert calls == [("is_iconic", 42), ("focus", 42)]
+
+
+def test_raise_codex_retry_unobserved_is_false(monkeypatch):
+    from types import SimpleNamespace
+    other = SimpleNamespace(hwnd=42, image="other.exe")
+    calls = _window_fakes(monkeypatch, [other, other])
+    assert not codex_module._raise_codex_window(lambda: 1)
+    assert len([call for call in calls if call[0] == "focus"]) == 2
+    assert len([call for call in calls if call[0] == "key"]) == 2
+
+
+@pytest.mark.parametrize("budgets,expected", [
+    ([1, 0], [("is_iconic", 42), ("focus", 42)]),
+    ([1, 1, 0], [("is_iconic", 42), ("focus", 42), ("key", 0x12, 0, 0, 0), ("key", 0x12, 0, 2, 0)]),
+    ([1, 1, 1, 0], [("is_iconic", 42), ("focus", 42), ("key", 0x12, 0, 0, 0), ("key", 0x12, 0, 2, 0)]),
+])
+def test_raise_codex_deadline_stops_retry_and_releases_alt(monkeypatch, budgets, expected):
+    calls = _window_fakes(monkeypatch, [None])
+    remaining = iter(budgets)
+    with pytest.raises(TurnExpired):
+        codex_module._raise_codex_window(lambda: next(remaining))
+    assert calls == expected
+
+
+def test_no_codex_window_returns_requested_without_launch(tmp_path, monkeypatch):
+    import ctypes
+    monkeypatch.setattr(codex_module.observe, "enumerate_windows", lambda: [])
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: pytest.fail("no window should not load user32"), raising=False)
+    adapter, bridge, _ = setup_handler(tmp_path)
+    adapter._raise_window = codex_module._raise_codex_window
+    receipt = adapter.execute({"request": "fix the tests"}, lambda: 1)
+    assert (receipt.state, receipt.detail) == ("requested", "unobserved")
+    assert len(bridge.calls) == 2

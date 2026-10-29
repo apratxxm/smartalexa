@@ -36,6 +36,20 @@ def _raise_codex_window(guard):
         raise TurnExpired()
     user32.SetForegroundWindow(window.hwnd)
     foreground = observe.foreground_window()
+    if not (foreground and foreground.hwnd == window.hwnd and foreground.image.casefold() == "codex.exe"):
+        if guard() <= 0:
+            raise TurnExpired()
+        user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+        try:
+            if guard() <= 0:
+                raise TurnExpired()
+        finally:
+            # Always release the key if the deadline expires after key-down.
+            user32.keybd_event(0x12, 0, 2, 0)  # KEYEVENTF_KEYUP
+        if guard() <= 0:
+            raise TurnExpired()
+        user32.SetForegroundWindow(window.hwnd)
+        foreground = observe.foreground_window()
     return bool(foreground and foreground.hwnd == window.hwnd and foreground.image.casefold() == "codex.exe")
 
 

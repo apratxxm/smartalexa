@@ -5,8 +5,8 @@ thresholds: # provisional (lead 28 Oct)
 lines:
   - {id: M1, mode: normal, category: music, capability: play_album, phrase: 'Alexa, play the album Lover'}
   - {id: M2, mode: normal, category: music, capability: play_artist, phrase: 'Alexa, play music by Beyonce'}
-  - {id: M3, mode: normal, category: music, capability: play_playlist, phrase: 'Alexa, play my playlist Gym', note: 'Use a playlist named Gym in the signed-in account.'}
-  - {id: M4, mode: normal, category: music, capability: queue_song, phrase: 'Alexa, queue Halo'}
+  - {id: M3, mode: normal, category: music, capability: play_playlist, phrase: 'Alexa, play my playlist DHH Gym', note: 'A real playlist in the signed-in account (lead 28 Oct).'}
+  - {id: M4, mode: normal, category: music, capability: queue_song, phrase: 'Alexa, queue Halo by Beyonce', note: 'Bare Halo is ambiguous by design (lead 28 Oct).'}
   - {id: M5, mode: normal, category: music, capability: previous_track, phrase: 'Alexa, previous track'}
   - {id: M6, mode: normal, category: music, capability: restart_track, phrase: 'Alexa, restart the track'}
   - {id: M7, mode: normal, category: music, capability: restart_album, phrase: 'Alexa, restart the album'}

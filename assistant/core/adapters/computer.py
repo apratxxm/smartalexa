@@ -66,6 +66,7 @@ class AppEntry:
     label: str
     target: str   # packaged: AUMID; exe: absolute path of a resolved .exe
     kind: str     # "packaged" | "exe"
+    image: str = ""
 
 
 def _key(value: str) -> str:
@@ -266,7 +267,9 @@ _CLASSIC = _ClassicSource(lambda: build_classic(
 
 def _default_catalog():
     computer_tools.warm_catalog()
-    packaged = tuple(AppEntry(label, ident, "packaged") for label, ident in computer_tools._catalog)
+    with computer_tools._lock:
+        packaged = tuple(AppEntry(label, ident, "packaged", computer_tools._package_images.get(ident.casefold(), ""))
+                         for label, ident in computer_tools._catalog)
     return packaged + _CLASSIC.get()
 
 
@@ -290,9 +293,13 @@ class _Base:
 class OpenApp(_Base):
     verbs = ("open", "launch", "start up")
 
-    def __init__(self, *, catalog=None, explorer=None, isfile=None, **kwargs):
+    def __init__(self, *, catalog=None, explorer=None, isfile=None, clock=time.monotonic, sleep=time.sleep, **kwargs):
         super().__init__(**kwargs)
+        self._clock, self._sleep = clock, sleep
         self._catalog = catalog or _default_catalog
+        if catalog is None:
+            computer_tools.warm_catalog()
+            _CLASSIC.get()
         self._explorer = explorer or (lambda: computer_tools._windows_binary("explorer.exe"))
         self._isfile = isfile or os.path.isfile
 
@@ -315,11 +322,29 @@ class OpenApp(_Base):
             return Receipt("failed", "invalid_name")
         try:
             entries = self._catalog()
+            candidates = _app_candidates(name, entries)
+            if not candidates and (not entries or (self._catalog is _default_catalog and
+                                                   (computer_tools._warming or _CLASSIC._warming))):
+                try:
+                    wait = min(2.0, remaining(guard))
+                except TurnExpired:
+                    return Receipt("failed", "catalogue_warming")
+                end = self._clock() + wait
+                while self._clock() < end:
+                    self._sleep(min(0.05, end - self._clock()))
+                    try:
+                        remaining(guard)
+                    except TurnExpired:
+                        break
+                    entries = self._catalog()
+                    candidates = _app_candidates(name, entries)
+                    if candidates:
+                        break
+            if not entries or (not candidates and self._catalog is _default_catalog and
+                               (computer_tools._warming or _CLASSIC._warming)):
+                return Receipt("failed", "catalogue_warming")
         except Exception as exc:  # Nothing dispatched yet.
             return Receipt("failed", "catalogue", error=type(exc).__name__)
-        if not entries:
-            return Receipt("failed", "catalogue_warming")
-        candidates = _app_candidates(name, entries)
         if len(candidates) != 1:
             return Receipt("failed", _NOT_FOUND)
         entry = candidates[0]
@@ -344,11 +369,25 @@ class OpenApp(_Base):
         except Exception as exc:
             return Receipt("unknown", "dispatch_uncertain", content=entry.label, error=type(exc).__name__)
         label = entry.label
-        expected = (ntpath.basename(entry.target).casefold() if entry.kind == "exe"
-                    else {"spotifyab.spotifymusic_zpdnekdrzrea0!spotify": "spotify.exe"}.get(entry.target.casefold(), ""))
+        def match(window):
+            if not _has_phrase(window.title, _key(label)):
+                return False
+            if entry.kind == "exe":
+                return window.image.casefold() == ntpath.basename(entry.target).casefold()
+            location = entry.image
+            if self._catalog is _default_catalog:
+                with computer_tools._lock:
+                    location = computer_tools._package_images.get(entry.target.casefold(), location)
+            if not location or not window.image_path:
+                return False
+            root = ntpath.normcase(ntpath.normpath(location))
+            path = ntpath.normcase(ntpath.normpath(window.image_path))
+            if not ntpath.isabs(root) or not ntpath.isabs(path):
+                return False
+            return path.startswith(root.rstrip("\\") + "\\")
+
         try:
-            hit = self._observer.wait_for(before, lambda w: bool(expected) and w.image.casefold() == expected
-                                          and _has_phrase(w.title, _key(label)), guard)
+            hit = self._observer.wait_for(before, match, guard)
         except Exception as exc:
             return Receipt("unknown", "observe_failed", content=label, error=type(exc).__name__)
         if hit is not None:
@@ -469,7 +508,7 @@ class _ShowSpotify(_Base):
         try:
             # The helper's verified ok is the receipt; foreground does not change it.
             self._helper(["--search", "--kind", self.kind, "--query=" + query],
-                         timeout=min(22.0, budget),
+                         timeout=min(22.0, budget), deadline=time.monotonic() + budget,
                          timeout_message="Spotify did not verify desktop search results before the UI timed out. "
                                          "Check Spotify before trying again; the search may have been submitted.")
         except computer_tools.ComputerDeliveryUnknown as exc:

@@ -314,3 +314,53 @@ def test_spotify_child_refusal_is_delivery_unknown_without_retry(monkeypatch, me
         tools._run_spotify_helper(["--run"], timeout_message="Check Spotify before trying again.")
     assert isinstance(caught.value, tools.ComputerControlError)
     run.assert_called_once()
+
+
+def test_resolve_package_images_passes_ids_as_data_and_uses_executable_basename():
+    from types import SimpleNamespace
+    import json
+    calls = []
+    ident = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout=json.dumps([
+            {"id": ident, "location": "C:\\Packages\\Calculator"},
+            {"id": "unrequested!App", "location": "C:\\evil"},
+        ]))
+    images = tools.resolve_package_images([ident, "Bad;Injected!App"], powershell=lambda: "powershell.exe", run=run)
+    assert images == {ident.casefold(): "c:\\packages\\calculator"}
+    assert json.loads(calls[0][1]["input"]) == [ident]
+    assert ident not in calls[0][0][-1]
+    assert "Get-AppxPackage" in calls[0][0][-1]
+    assert "AppxManifest.xml" in calls[0][0][-1]
+    assert calls[0][1]["timeout"] == 60
+
+
+def test_package_resolver_failure_is_unresolved():
+    from types import SimpleNamespace
+    assert tools.resolve_package_images(["Family!App"], powershell=lambda: "powershell.exe",
+                                        run=lambda *a, **k: SimpleNamespace(returncode=1, stdout="")) == {}
+
+
+def test_catalogue_names_published_before_package_resolution(monkeypatch):
+    rows = (("Calculator", "Family!App"), ("Classic", "Classic.NoPackage"))
+    seen = []
+    class Thread:
+        def __init__(self, **kwargs):
+            self.target = kwargs["target"]
+        def start(self):
+            self.target()
+    def resolve(ids):
+        seen.append((tools._catalog, ids))
+        return {"family!app": r"c:\package"}
+    monkeypatch.setattr(tools, "_catalog", ())
+    monkeypatch.setattr(tools, "_package_images", {})
+    monkeypatch.setattr(tools, "_warming", False)
+    monkeypatch.setattr(tools, "_loaded_at", 0.0)
+    monkeypatch.setattr(tools, "_attempted_at", 0.0)
+    monkeypatch.setattr(tools, "_load_catalog", lambda: rows)
+    monkeypatch.setattr(tools, "resolve_package_images", resolve)
+    monkeypatch.setattr(tools.threading, "Thread", Thread)
+    tools.warm_catalog()
+    assert seen == [(rows, ["Family!App"])]
+    assert tools._package_images == {"family!app": r"c:\package"}

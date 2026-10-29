@@ -283,3 +283,73 @@ def test_spotify_search_rejects_invalid_queries_or_kinds_before_submission(query
     with pytest.raises(SpotifyJamError):
         drive_search(backend, query=query, kind=kind)
     assert backend.submissions == []
+
+
+def test_spotify_search_prefers_search_link_over_typing():
+    # Live 28 Oct: typing into Spotify's UI was fragile; spotify:search:<query> is not.
+    class LinkBackend(FakeSearchBackend):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.opened = []
+        def open_search(self, query):
+            self.opened.append(query)
+    backend = LinkBackend([search_results("Red Seedhe Maut")])
+    assert drive_search(backend) == "Spotify desktop search results are visible for that query."
+    assert backend.opened == ["Red Seedhe Maut"] and backend.submissions == []
+
+
+def test_spotify_search_accepts_hyperlink_filters():
+    # Spotify 1.2.x renders All/Songs/Playlists/Albums as hyperlinks.
+    controls = [Control("What do you want to play?", "combobox", True, False, "Red Seedhe Maut")]
+    controls.extend(control(name, "hyperlink") for name in ("All", "Songs", "Playlists", "Albums"))
+    controls.extend(control(name, "text") for name in ("RED", "Seedhe Maut"))
+    assert drive_search(FakeSearchBackend([Snapshot(tuple(controls))])).startswith("Spotify desktop search results")
+
+
+def test_windows_backend_creates_uia_from_coclass_not_progid():
+    import inspect
+    from assistant.spotify_jam import WindowsSpotifyBackend
+    source = inspect.getsource(WindowsSpotifyBackend.__init__)
+    assert 'CreateObject("UIAutomationClient.CUIAutomation"' not in source
+    assert "CreateObject(CUIAutomation" in source
+
+
+def test_search_tree_warmup_retries_until_present():
+    from assistant.spotify_jam import WindowsSpotifyBackend
+    clock = FakeTime()
+    backend = WindowsSpotifyBackend.__new__(WindowsSpotifyBackend)
+    backend.clock, backend.sleep, backend.deadline = clock.now, clock.sleep, None
+    trees = iter([(None, []), (None, [object()])])
+    backend._search_elements = lambda: next(trees)
+    assert len(backend._wait_for_search()[1]) == 1
+    assert 0 < clock.value <= 3
+
+
+def test_search_tree_warmup_fails_after_bound_without_input():
+    from assistant.spotify_jam import WindowsSpotifyBackend
+    clock = FakeTime()
+    backend = WindowsSpotifyBackend.__new__(WindowsSpotifyBackend)
+    backend.clock, backend.sleep, backend.deadline = clock.now, clock.sleep, None
+    backend._search_elements = lambda: (None, [])
+    with pytest.raises(SpotifyJamError, match="named search box is unavailable"):
+        backend.submit_search("hello")
+    assert clock.value == pytest.approx(3)
+
+
+def test_search_tree_warmup_deadline_sends_no_input():
+    from assistant.spotify_jam import WindowsSpotifyBackend
+    clock = FakeTime()
+    backend = WindowsSpotifyBackend.__new__(WindowsSpotifyBackend)
+    backend.clock, backend.sleep, backend.deadline = clock.now, clock.sleep, 0.1
+    backend._search_elements = lambda: (None, [])
+    with pytest.raises(SpotifyJamError, match="deadline expired"):
+        backend.submit_search("hello")
+    assert clock.value == pytest.approx(0.1)
+
+
+def test_jam_minimal_tree_warms_before_click():
+    clock = FakeTime()
+    backend = FakeBackend([Snapshot(()), Snapshot((control("Start a Jam"),)), invitation()])
+    assert drive_spotify_jam(backend, timeout=4, clock=clock.now, sleep=clock.sleep) == SUCCESS
+    assert backend.clicks == ["Start a Jam"]
+    assert clock.value > 0

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 import re
 import sys
@@ -10,6 +11,9 @@ import time
 from typing import Iterable
 
 from .external_apps import open_external_target
+
+_logger = logging.getLogger(__name__)
+_logger.addHandler(logging.NullHandler())
 
 
 class SpotifyJamError(RuntimeError):
@@ -37,7 +41,8 @@ SUCCESS = "Jam QR is on screen."
 _JAM_BUTTON_SUFFIXES = ("'s jam", "’s jam")
 SEARCH_CONTROL_NAME = "What do you want to play?"
 SEARCH_FILTERS = ("All", "Songs", "Playlists", "Albums")
-_SEARCH_FILTER_KINDS = ("button", "tabitem", "radiobutton", "toggle")
+# Spotify 1.2.x (Oct 2026) renders the search filters as hyperlinks.
+_SEARCH_FILTER_KINDS = ("button", "tabitem", "radiobutton", "toggle", "hyperlink")
 
 
 def _input_types(ctypes_module, pointer_type=None):
@@ -137,7 +142,13 @@ def drive_spotify_search(backend, query: str, kind: str, *, timeout: float = 10.
                          clock=time.monotonic, sleep=time.sleep) -> str:
     """Submit once to Spotify's named native search and await matching results."""
     query = _validate_search(query, kind)
-    backend.submit_search(query)
+    # Spotify's own search link opens the results page and raises the app without
+    # focus tricks or typed input; backends without it type into the search box.
+    opener = getattr(backend, "open_search", None)
+    if callable(opener):
+        opener(query)
+    else:
+        backend.submit_search(query)
     deadline = clock() + timeout
     while clock() < deadline:
         if _search_verified(backend.snapshot(), query):
@@ -155,10 +166,22 @@ def drive_spotify_jam(backend, *, timeout: float = 12.0,
     """
     deadline = min(clock() + timeout, deadline) if deadline is not None else clock() + timeout
     acted: set[str] = set()
+    warm_until = min(deadline, clock() + 3.0)
+    ready = False
     while clock() < deadline:
         snapshot = backend.snapshot()
         controls = _visible(snapshot)
         has_prompt, has_instructions, copy_buttons = _invite_evidence(snapshot)
+        if not ready:
+            ready = bool(has_prompt or has_instructions or any(
+                control.kind.casefold() in {"button", "toggle", "heading"}
+                and (_fold(control.name) in {"connect to a device", "start a jam", "invite"}
+                     or _fold(control.name).endswith(_JAM_BUTTON_SUFFIXES))
+                for control in controls))
+            if not ready and clock() < warm_until:
+                sleep(min(0.15, max(0.0, warm_until - clock())))
+                continue
+            ready = True
         if has_prompt or has_instructions:
             if not (has_prompt and has_instructions):
                 raise SpotifyJamError("Spotify's Jam invitation panel is incomplete. Check the app before trying again.")
@@ -293,8 +316,9 @@ class WindowsSpotifyBackend:
         try:
             from comtypes.client import CreateObject, GetModule
             GetModule("UIAutomationCore.dll")
-            from comtypes.gen.UIAutomationClient import IUIAutomation
-            self.automation = CreateObject("UIAutomationClient.CUIAutomation", interface=IUIAutomation)
+            from comtypes.gen.UIAutomationClient import CUIAutomation, IUIAutomation
+            # The ProgID "UIAutomationClient.CUIAutomation" is not registered on Windows; use the coclass.
+            self.automation = CreateObject(CUIAutomation, interface=IUIAutomation)
         except Exception as exc:
             raise SpotifyJamError("Windows UI Automation is unavailable. Open Spotify and try again.") from exc
 
@@ -352,6 +376,15 @@ class WindowsSpotifyBackend:
                 self.user32.ShowWindow(self.hwnd, 9)  # SW_RESTORE
             self._check_deadline()
             self.user32.SetForegroundWindow(self.hwnd)
+            if int(self.user32.GetForegroundWindow() or 0) != self.hwnd:
+                # Windows refuses focus to background processes; one Alt tap lifts that
+                # foreground lock (the documented input exemption). Retry exactly once.
+                self._check_deadline()
+                self.user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+                self.user32.keybd_event(0x12, 0, 2, 0)  # KEYEVENTF_KEYUP
+                self._check_deadline()
+                self.user32.SetForegroundWindow(self.hwnd)
+                self.sleep(0.1)
         if int(self.user32.GetForegroundWindow() or 0) != self.hwnd:
             raise SpotifyJamError("Spotify focus changed or could not be acquired. No desktop control was activated.")
         pid = self.wintypes.DWORD()
@@ -365,15 +398,21 @@ class WindowsSpotifyBackend:
         try:
             root = self.automation.ElementFromHandle(self.hwnd)
             descendants = root.FindAll(4, self.automation.CreateTrueCondition())  # TreeScope_Descendants
-            if descendants.Length > 1200:
+            if descendants.Length > 4000:  # A results page is ~1000 elements.
                 raise SpotifyJamError("Spotify's accessible UI is too large to inspect safely.")
             controls, text = [], []
             for index in range(descendants.Length):
                 element = descendants.GetElement(index)
-                name = (element.CurrentName or "").strip()
-                if not name or element.CurrentIsOffscreen:
+                try:
+                    name = (element.CurrentName or "").strip()
+                    if not name or element.CurrentIsOffscreen:
+                        continue
+                    kind_id = element.CurrentControlType
+                except Exception as exc:
+                    # Spotify re-renders while results load; an element that vanished
+                    # mid-read is skipped (read-only), the caller's poll reads again.
+                    _logger.debug("Skipped a vanished Spotify element: %s", type(exc).__name__)
                     continue
-                kind_id = element.CurrentControlType
                 kind = {
                     self._BUTTON: "button", self._TEXT: "text", self._HYPERLINK: "hyperlink",
                     self._COMBOBOX: "combobox",
@@ -395,6 +434,7 @@ class WindowsSpotifyBackend:
         except SpotifyJamError:
             raise
         except Exception as exc:
+            _logger.debug("Spotify snapshot failed: %s: %s", type(exc).__name__, exc)
             raise SpotifyJamError("Spotify's desktop controls could not be read. Confirm the app is open and try again.") from exc
 
     def click(self, name: str) -> None:
@@ -460,6 +500,21 @@ class WindowsSpotifyBackend:
             raise SpotifyJamError("Spotify shows multiple matching search boxes. I stopped without entering text.")
         return root, matches
 
+    def _wait_for_search(self):
+        end = self.clock() + 3.0
+        if self.deadline is not None:
+            end = min(end, self.deadline)
+        while True:
+            self._check_deadline()
+            root, matches = self._search_elements()
+            self._check_deadline()
+            if matches:
+                return root, matches
+            remaining = end - self.clock()
+            if remaining <= 1e-6:  # float residue after repeated sleeps counts as done
+                return root, matches
+            self.sleep(min(0.15, remaining))
+
     def _focused_in_search(self, search_element) -> bool:
         self._focus()
         try:
@@ -503,6 +558,7 @@ class WindowsSpotifyBackend:
         # before injecting the single Return key pair.
         if not self._focused_in_search(search_element):
             raise SpotifyJamError("Spotify's search focus changed before submission. No key was sent.")
+        self._check_deadline()
         sent = self.user32.SendInput(2, events, c.sizeof(INPUT))
         if sent != 2:
             if sent == 1:
@@ -511,10 +567,27 @@ class WindowsSpotifyBackend:
                 self.user32.SendInput(1, release, c.sizeof(INPUT))
             raise SpotifyJamError("Spotify's search submission is uncertain. Check the app before retrying.")
 
+    def open_search(self, query: str) -> None:
+        from urllib.parse import quote
+        query = _validate_search(query, "track")
+        self._check_deadline()
+        try:
+            open_external_target("spotify:search:" + quote(query, safe=""))
+        except OSError as exc:
+            raise SpotifyJamError("Spotify's search link could not be opened.") from exc
+        self._ensure_window()
+        # The link raises Spotify itself; give it a moment before any focus attempt.
+        settle = self.clock() + 2.0
+        while self.clock() < settle and int(self.user32.GetForegroundWindow() or 0) != self.hwnd:
+            self._check_deadline()
+            self.sleep(0.1)
+        if int(self.user32.GetForegroundWindow() or 0) == self.hwnd:
+            self._activated = True
+
     def submit_search(self, query: str) -> None:
         query = _validate_search(query, "track")
         try:
-            _root, matches = self._search_elements()
+            _root, matches = self._wait_for_search()
         except SpotifyJamError:
             raise
         except Exception as exc:
@@ -525,6 +598,7 @@ class WindowsSpotifyBackend:
         try:
             from comtypes.gen.UIAutomationClient import IUIAutomationValuePattern
             value_pattern = element.GetCurrentPattern(self._VALUE_PATTERN).QueryInterface(IUIAutomationValuePattern)
+            self._check_deadline()
             value_pattern.SetValue(query)
         except Exception as exc:
             raise SpotifyJamError("Spotify's search text update is uncertain. Check the app before retrying; Return was not sent.") from exc
@@ -541,6 +615,7 @@ class WindowsSpotifyBackend:
             raise SpotifyJamError("Spotify's search box changed after text entry. No key was sent.")
         element = matches[0]
         try:
+            self._check_deadline()
             element.SetFocus()
         except Exception as exc:
             raise SpotifyJamError("Spotify's search box could not be focused. No key was sent.") from exc
@@ -616,10 +691,10 @@ def _run_native(deadline=None) -> dict[str, object]:
         return {"ok": False, "message": "Spotify's Jam invite state could not be verified. Check the app before trying again."}
 
 
-def _run_native_search(query: str, kind: str) -> dict[str, object]:
+def _run_native_search(query: str, kind: str, deadline=None) -> dict[str, object]:
     try:
         query = _validate_search(query, kind)
-        message = drive_spotify_search(WindowsSpotifyBackend(), query, kind, timeout=8.0)
+        message = drive_spotify_search(WindowsSpotifyBackend(deadline=deadline), query, kind, timeout=8.0)
         return {"ok": True, "message": message}
     except SpotifyJamError as exc:
         return {"ok": False, "message": str(exc)}
@@ -637,9 +712,17 @@ def main() -> int:
         except ValueError:
             return 2
         payload = _run_native(deadline)
-    elif (len(args) == 4 and args[0] == "--search" and args[1] == "--kind"
+    elif (len(args) in (4, 5) and args[0] == "--search" and args[1] == "--kind"
           and args[3].startswith("--query=")):
-        payload = _run_native_search(args[3][len("--query="):], args[2])
+        deadline = None
+        if len(args) == 5:
+            if not args[4].startswith("--deadline="):
+                return 2
+            try:
+                deadline = float(args[4][len("--deadline="):])
+            except ValueError:
+                return 2
+        payload = _run_native_search(args[3][len("--query="):], args[2], deadline)
     else:
         return 2
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

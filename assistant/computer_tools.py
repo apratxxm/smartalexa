@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ _TTL = 300.0
 _RETRY = 15.0
 _lock = threading.Lock()
 _catalog = ()
+_package_images = {}
 _loaded_at = 0.0
 _attempted_at = 0.0
 _warming = False
@@ -96,6 +98,57 @@ def _load_catalog():
     return tuple(entries.values())
 
 
+_PACKAGE_RESOLVE_SCRIPT = (
+    "$ErrorActionPreference='Stop';"
+    "$ids = [Console]::In.ReadToEnd() | ConvertFrom-Json;"
+    "$packages = @(Get-AppxPackage); $out = @();"
+    "foreach ($id in @($ids)) { try {"
+    "$parts = ([string]$id).Split('!'); if ($parts.Count -ne 2) { continue };"
+    "$pkg = @($packages | Where-Object { $_.PackageFamilyName -eq $parts[0] });"
+    "if ($pkg.Count -ne 1 -or -not $pkg[0].InstallLocation) { continue };"
+    "$manifest = Join-Path -Path $pkg[0].InstallLocation -ChildPath 'AppxManifest.xml';"
+    "[xml]$xml = Get-Content -LiteralPath $manifest -Raw;"
+    "$apps = @($xml.SelectNodes('/*[local-name()=\"Package\"]/*[local-name()=\"Applications\"]/*[local-name()=\"Application\"]') | "
+    "Where-Object { $_.GetAttribute('Id') -eq $parts[1] });"
+    "if ($apps.Count -eq 1) { $out += [pscustomobject]@{id=[string]$id; location=[string]$pkg[0].InstallLocation} }"
+    "} catch { continue } }; ConvertTo-Json -InputObject @($out) -Compress"
+)
+
+
+def resolve_package_images(ids, *, powershell=None, run=subprocess.run):
+    ids = [ident for ident in ids if isinstance(ident, str) and _APP_ID.fullmatch(ident)
+           and ident.count("!") == 1]
+    if not ids:
+        return {}
+    try:
+        binary = powershell() if powershell else _windows_binary("System32/WindowsPowerShell/v1.0/powershell.exe")
+        result = run([str(binary), "-NoProfile", "-NonInteractive", "-Command", _PACKAGE_RESOLVE_SCRIPT],
+                     input=json.dumps(ids), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                     timeout=60.0, check=False, text=True,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode != 0 or not isinstance(result.stdout, str) or len(result.stdout) > 262144:
+            return {}
+        rows = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return {}
+    allowed = {ident.casefold() for ident in ids}
+    images = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ident, location = row.get("id"), row.get("location")
+        if not isinstance(ident, str) or ident.casefold() not in allowed or not isinstance(location, str):
+            continue
+        normalized = ntpath.normcase(ntpath.normpath(location))
+        if ntpath.isabs(normalized) and not re.search(r"[\x00-\x1f\x7f]", normalized):
+            images[ident.casefold()] = normalized
+    return images
+
+
 def warm_catalog() -> None:
     """Optional daemon warm; never make a voice command wait on PowerShell."""
     global _warming, _attempted_at
@@ -105,11 +158,16 @@ def warm_catalog() -> None:
             return
         _warming, _attempted_at = True, now
     def load():
-        global _catalog, _loaded_at, _warming
+        global _catalog, _package_images, _loaded_at, _warming
         try:
             entries = _load_catalog()
             with _lock:
                 _catalog, _loaded_at = entries, time.monotonic()
+                allowed = {ident.casefold() for _, ident in entries if ident.count("!") == 1}
+                _package_images = {ident: path for ident, path in _package_images.items() if ident in allowed}
+            images = resolve_package_images([ident for _, ident in entries if ident.count("!") == 1])
+            with _lock:
+                _package_images = images
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
         finally:
@@ -128,7 +186,13 @@ def _text(value: str) -> str:
     return value.strip()
 
 
-def _run_spotify_helper(arguments: list[str], *, timeout_message: str, timeout: float = 15.0) -> str:
+def _run_spotify_helper(arguments: list[str], *, timeout_message: str, timeout: float = 15.0,
+                        deadline: float | None = None) -> str:
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise ComputerControlError("The Spotify deadline expired before dispatch.")
+        arguments = [*arguments, "--deadline=" + repr(deadline)]
     command = [sys.executable, "-m", "assistant.spotify_jam", *arguments]
     try:
         result = subprocess.run(

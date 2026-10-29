@@ -5,6 +5,7 @@ speaker. We only send transport commands.
 """
 from __future__ import annotations
 
+import unicodedata
 import argparse
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -812,6 +813,47 @@ class Spotify:
                 time.sleep(spacing)
         raise PlaybackVerificationError("Could not verify " + description + " on the selected laptop")
 
+    def _idle_uri_budget(self):
+        return float("inf")
+
+    def _open_idle_uri(self, uri):
+        open_external_target(uri)
+
+    @staticmethod
+    def _is_local_target(target, devices):
+        hostname = socket.gethostname().strip().casefold()
+        local = [device for device in devices if isinstance(device, dict)
+                 and str(device.get("name", "")).strip().casefold() == hostname
+                 and str(device.get("type", "")).casefold() == "computer"
+                 and not device.get("is_restricted")]
+        return bool(target and len(local) == 1 and local[0].get("id") == target)
+
+    def _start_idle_uri(self, uri, predicate, description):
+        self._idle_uri_budget()
+        self._open_idle_uri(uri)
+        try:
+            deadline = time.monotonic() + min(4.0, self._idle_uri_budget())
+            self._idle_uri_deadline = deadline
+            for attempt in range(4):
+                if time.monotonic() >= deadline:
+                    break
+                self._idle_uri_budget()
+                state = self.sp.current_playback()
+                self._idle_uri_budget()
+                now = time.monotonic()
+                if now <= deadline and state and (state.get("device") or {}).get("id") == self.device() and predicate(state):
+                    return
+                if attempt < 3 and now < deadline:
+                    time.sleep(min(4.0 / 3, deadline - now, self._idle_uri_budget()))
+            raise PlaybackVerificationError("Could not verify " + description + " on the selected laptop")
+        except Exception as exc:
+            uncertainty = _playback_uncertainty(exc)
+            if uncertainty is exc:
+                raise
+            raise uncertainty from exc
+        finally:
+            self._idle_uri_deadline = None
+
     def _local_enabled(self) -> bool:
         cfg = getattr(self, "_cfg", None)
         return bool(cfg is not None and cfg.get("spotify.local_transport", True))
@@ -1454,13 +1496,20 @@ class Spotify:
             requested = title_key(requested_title, requested_title)
             exact_title = title_key(ranked[0].name, requested_title) == requested
             credits = (ranked[0].metadata or {}).get("artists") or [{"name": ranked[0].artist}]
-            exact_artist = bool(artist and any(_norm(row.get("name", "")) == _norm(artist)
+            # Spoken artists come without accents ("Beyonce"); Spotify keeps them ("Beyoncé").
+            fold = lambda value: "".join(ch for ch in unicodedata.normalize("NFKD", _norm(value))
+                                           if not unicodedata.combining(ch))
+            exact_artist = bool(artist and any(fold(row.get("name", "")) == fold(artist)
                                               for row in credits))
             competing_same_title = title_key(ranked[1].name, requested_title) == requested
             rival_credits = (ranked[1].metadata or {}).get("artists") or [{"name": ranked[1].artist}]
-            rival_exact_artist = bool(artist and any(_norm(row.get("name", "")) == _norm(artist)
+            rival_exact_artist = bool(artist and any(fold(row.get("name", "")) == fold(artist)
                                                     for row in rival_credits))
-            if not (exact_title and (not competing_same_title or exact_artist and not rival_exact_artist)):
+            # A solo credit for the named artist beats a same-title version that adds
+            # collaborators: "Halo by Beyonce" vs the 2CELLOS cover crediting Beyonce as writer.
+            solo = lambda rows: bool(artist) and {fold(row.get("name", "")) for row in rows} == {fold(artist)}
+            solo_wins = exact_artist and rival_exact_artist and solo(credits) and not solo(rival_credits)
+            if not (exact_title and (not competing_same_title or exact_artist and not rival_exact_artist or solo_wins)):
                 self._note_resolution(via + ":ambiguous", *_title_diag(requested, ranked))
                 raise AmbiguousMatch(query, ranked[:3])
         self._note_resolution(via, *_title_diag(title if artist else query, ranked))
@@ -1626,6 +1675,10 @@ class Spotify:
             if not rank_albums(rows, title, artist):
                 rows = rows + lookup(title.strip())
         ranked = rank_albums(rows, title, artist)
+        exact = [(score, candidate) for score, candidate in ranked
+                 if album_key(candidate.name) == album_key(title)]
+        if exact:
+            ranked = exact
         if not ranked:
             self._note_resolution("album_search:not_found")
             raise LookupError("No confident album match for " + repr(query))
@@ -1720,7 +1773,7 @@ class Spotify:
         return False
 
     def play_candidate(self, candidate: Candidate, then: Optional[list] = None) -> str:
-        """Start one track: Web API first (no window, fastest), else the app link.
+        """Start a local track via its URI, or use the Web API for other targets.
 
         ``then`` is a radio: track URIs sent in the same start_playback call, so
         the song plays first and the radio follows. Verification still checks
@@ -1737,14 +1790,38 @@ class Spotify:
         self.last_playback = None
         # Why the Web API did not carry this playback, for telemetry.
         skipped = ""
+        local_target = None
+        with self.command_target():
+            target = self.device()
+            try:
+                devices = self.sp.devices().get("devices", [])
+                if (self._is_local_target(target, devices) and
+                        not any(isinstance(device, dict) and device.get("is_active") is True
+                                and device.get("id") != target for device in devices)):
+                    local_target = target
+            except Exception:
+                devices = []
+            if local_target:
+                if not isinstance(candidate.uri, str) or not re.fullmatch(r"spotify:track:[A-Za-z0-9]+", candidate.uri):
+                    raise ValueError("Valid Spotify track URI required")
+                self._start_idle_uri(candidate.uri, lambda state: state.get("is_playing") is True and (
+                    (state.get("item") or {}).get("uri") == candidate.uri
+                    or ((state.get("item") or {}).get("linked_from") or {}).get("uri") == candidate.uri
+                ), "requested track")
+                self.last_playback = {"method": "uri_handler", "radio": 0,
+                                      "radio_skipped": len(follow),
+                                      "ms": int((time.perf_counter() - started) * 1000)}
+                return candidate.label
         if self._local_enabled():
             api_error = None
             accepted = False
             dispatch_attempted = False
             mutation = None
             accepted_at = None
+            fallback_allowed = False
             try:
                 with self.command_target():
+                    fallback_allowed = bool(local_target and self.device() == local_target)
                     mutation = self.sp.start_playback
                     dispatch_attempted = True
                     self._call(mutation, uris=uris)
@@ -1799,6 +1876,8 @@ class Spotify:
                 api_error = exc
                 skipped = ("local_request_deferred" if isinstance(exc, SpotifyRequestDeferred) else
                            "rate_limited" if isinstance(exc, SpotifyRateLimited) else type(exc).__name__)
+                if not fallback_allowed:
+                    raise
                 log.info("Web API playback stopped before dispatch (%s); trying the desktop", type(exc).__name__)
             try:
                 desktop_started = self._play_uri_locally(candidate)
