@@ -4,6 +4,7 @@ import hashlib
 import fnmatch
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -30,7 +31,7 @@ def _exclusion(name: str, root=None):
             return "metadata or cache"
         if part.endswith((".pyc", ".log", ".pem", ".key")) or fnmatch.fnmatchcase(part, "credentials*.json") or fnmatch.fnmatchcase(part, "*token*.json"):
             return "generated or credential file"
-        if part.startswith(".venv") or (part in {"venv", "env"} and root is not None and (root.joinpath(*parts[:index + 1]) / "pyvenv.cfg").is_file()):
+        if part.startswith(".venv") or (root is not None and (root.joinpath(*parts[:index + 1]) / "pyvenv.cfg").is_file()):
             return "virtual environment"
         if index == 1 and parts[0].lower() == "assistant" and part == "logs":
             return "assistant logs"
@@ -132,10 +133,11 @@ def _validate(archive, manifest):
     expected = manifest["files"]
     if set(names) != set(expected) | {MANIFEST}:
         raise ValueError("Archive entries differ from manifest")
+    casefolded_names = {item.casefold() for item in names}
     for name in names:
         parts = PurePosixPath(name).parts
         for index, part in enumerate(parts):
-            if part.lower() in {"env", "venv"} and "/".join(parts[:index + 1] + ("pyvenv.cfg",)) in names:
+            if "/".join(parts[:index + 1] + ("pyvenv.cfg",)).casefold() in casefolded_names:
                 raise ValueError(f"Excluded virtual environment: {name}")
     for entry in entries:
         name = entry.filename
@@ -208,23 +210,36 @@ def legacy_startup_check(restored_root, python, *, live_root=None):
     live = Path(live_root).resolve(strict=True) if live_root else Path(__file__).resolve().parents[2]
     with (restored / "assistant" / "config.toml").open("rb") as source:
         config = tomllib.load(source)
-    assets = {}
+    prerequisites = {}
+    env_path = live / ".env"
+    prerequisites["env_file"] = "present" if env_path.is_file() else "missing"
+    env_names = set()
+    if env_path.is_file():
+        with env_path.open(encoding="utf-8") as source:
+            for line in source:
+                match = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+                if match:
+                    env_names.add(match.group(1))
+    for name in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"):
+        prerequisites["env_key:" + name] = "present" if name in env_names else "missing"
+    prerequisites["spotify_token_cache"] = "present" if (live / ".cache").is_file() else "missing"
+    prerequisites["codex_sign_in"] = "present" if (Path.home() / ".codex" / "auth.json").is_file() else "missing"
     for section, key in (("wake", "model"), ("listener", "stt_model"), ("stt", "model")):
         value = config.get(section, {}).get(key)
         values = value if isinstance(value, list) else [value]
         for item in values:
-            label = f"{section}.{key}:{item}"
+            label = f"model:{section}.{key}:{item}"
             if not isinstance(item, str) or not item:
-                assets[label] = {"status": "missing_config"}
+                prerequisites[label] = "missing"
                 continue
             model = item.removeprefix("faster-whisper/")
             if "/" not in model and "\\" not in model and ":" not in model:
-                assets[label] = {"status": "named_model_unverified"}
+                prerequisites[label] = "unverified"
                 continue
             path = Path(model)
             if not path.is_absolute():
                 path = live / path
-            assets[label] = {"status": "present" if path.exists() else "missing", "path": str(path)}
+            prerequisites[label] = "present" if path.exists() else "missing"
     probe = '''
 import importlib, json, socket, subprocess, sys
 from unittest.mock import patch
@@ -258,11 +273,13 @@ print(json.dumps(result))
         result = json.loads(completed.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
         result = {"imports_ok": False, "error": "Probe returned no valid result"}
-    result.update({"returncode": completed.returncode, "env_exists": (live / ".env").is_file(),
-                   "model_assets": assets, "scope": "import-level check; not a live startup"})
-    result["unverified"] = [name for name, item in assets.items() if item["status"] == "named_model_unverified"]
-    result["ok"] = (completed.returncode == 0 and result.get("imports_ok") is True
-                    and result.get("runtime_module") == "assistant.main" and result["env_exists"]
-                    and bool(result.get("packages")) and all(value is True for value in result["packages"].values())
-                    and all(item["status"] not in {"missing", "missing_config"} for item in assets.values()))
-    return result
+    for name, value in result.get("packages", {}).items():
+        prerequisites["package:" + name] = "present" if value is True else "missing"
+    import_ok = (completed.returncode == 0 and result.get("imports_ok") is True
+                 and result.get("runtime_module") == "assistant.main")
+    return {"import_level": {"ok": import_ok, "runtime_module": result.get("runtime_module"),
+                             "returncode": completed.returncode, "error": result.get("error")},
+            "prerequisites": prerequisites,
+            "unverified": [name for name, value in prerequisites.items() if value == "unverified"],
+            "scope": "import-level check; not a live startup",
+            "ok": import_ok and all(value != "missing" for value in prerequisites.values())}

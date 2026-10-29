@@ -2,6 +2,7 @@ import subprocess
 import os
 import sys
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -117,3 +118,84 @@ with single_instance(Path(sys.argv[1])):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree control required")
+def test_real_supervisor_tree_stop_and_restart(tmp_path):
+    from assistant.runtime import single_instance
+    root = tmp_path / "project"
+    (root / "assistant" / "logs").mkdir(parents=True)
+    config_file = root / "assistant" / "config.toml"
+    config_file.write_text('[runtime]\nruntime = "legacy"\n')
+    child_script = '''import os, sys, time
+from pathlib import Path
+from assistant.runtime import single_instance
+root = Path(sys.argv[1])
+with single_instance(root):
+ (root / "child-ready").write_text(Path(__file__).stem + ":" + str(os.getpid()))
+ deadline = time.monotonic() + 30
+ while time.monotonic() < deadline and not (root / "stop-child").exists(): time.sleep(0.05)
+'''
+    for module in ("fake_legacy", "fake_core"):
+        (tmp_path / (module + ".py")).write_text(child_script)
+    launcher = '''import sys, os, threading
+from pathlib import Path
+from assistant import config, supervise
+root = Path(sys.argv[1])
+watchdog = threading.Timer(45, lambda: os._exit(2))
+watchdog.daemon = True
+watchdog.start()
+config.ROOT = supervise.ROOT = root
+config.CONFIG_PATH = root / "assistant" / "config.toml"
+supervise.install_process_lifetime = lambda: None
+supervise.ensure_review_server = lambda: None
+supervise.ensure_local_ollama = lambda: None
+real_resolve = supervise.resolve_runtime_module
+supervise.resolve_runtime_module = lambda cfg: "fake_core" if real_resolve(cfg) == "assistant.core" else "fake_legacy"
+original_popen = supervise.subprocess.Popen
+supervise.subprocess.Popen = lambda args, **kwargs: original_popen(args + [str(root)], **kwargs)
+supervise.main()
+'''
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(Path(__file__).resolve().parents[2])])
+    ready = root / "child-ready"
+    def start():
+        process = subprocess.Popen([sys.executable, "-B", "-c", launcher, str(root)], env=env)
+        deadline = time.monotonic() + 15
+        while not ready.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                pytest.fail("supervisor exited before child became ready")
+            time.sleep(0.05)
+        assert ready.exists()
+        return process
+    def stop(process):
+        result = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, timeout=10)
+        if result.returncode:
+            process.kill()
+            process.wait(timeout=10)
+            (root / "stop-child").touch()
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    with single_instance(root):
+                        break
+                except Exception:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            pytest.skip("Windows taskkill tree control unavailable: " + result.stderr.decode(errors="replace").strip())
+        process.wait(timeout=10)
+        with single_instance(root):
+            pass
+    process = start()
+    try:
+        assert ready.read_text().startswith("fake_legacy:")
+        stop(process)
+        ready.unlink()
+        config_file.write_text('[runtime]\nruntime = "core"\n')
+        process = start()
+        assert ready.read_text().startswith("fake_core:")
+        stop(process)
+    finally:
+        if process.poll() is None:
+            stop(process)
