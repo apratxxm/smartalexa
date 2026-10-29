@@ -12,6 +12,7 @@ Updated 2026-10-27. Read on resume; material updates only. Plan of record: [STRA
 - **Tests:** full `pytest tests`: only 45 failures, all out of scope (33 global_assistant/conversation_flow = delete-candidates, pre-existing; 12 token_tracker = separate product). Kept-module failures fixed 28 Oct (test-state leaks; spotify quota file read without mtime shortcut).
 - **Trial harness** `python -m assistant.core.trials {phase1,phase1b,phase3,phase4} [--outage]`, `--combine`; scripts `docs/trials/*.yaml` (every line checked against the real grammar; 1b/4 thresholds provisional). Phase 1 truncated negative is now "Alexa, set the volume to"; grammar accepts "set the volume to N".
 - **Phase 5 plan** `docs/research/PHASE5_PLAN.md`: Sol design review done 28 Oct (lifecycle + legacy-startup gates folded in). Two user calls, both "retain" recommended: manual CLIs/knowledge_retrieval; stored artifacts.
+- **Phase 5 step 1 tooling** `python -m assistant.cutover backup|verify|restore|legacy-check` (b1f37d1): Sol diff review 2 rounds, all findings closed except F8 accepted residual (same-user race during scratch restore). 61 tests incl. a real supervisor process-tree stop/restart. Not yet run on the real tree; runs as step 1 once live gates pass.
 - **Wake:** bench + recorder; synthetic candidate `models/wake/candidates/20261027-synthtts-lessac/alexa_synth.onnx` (provisional; synthetic held-out recall 0.944 vs stock 0.778 @0.5). Not wired.
 - **Cutover map** `docs/research/CUTOVER_MAP.md` (re-run before phase 5; `.env` excluded from the backup).
 
