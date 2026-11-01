@@ -8,6 +8,7 @@ import socket
 import shutil
 import subprocess
 import threading
+import time
 import wave
 
 import pytest
@@ -32,21 +33,99 @@ def test_source_categories_do_not_infer_wake_presence_or_use_scores():
     assert ui.source_classification(copied)[0] == "all"
     assert ui.source_classification(copied_retry)[0] == "all"
     assert ui.source_classification(other)[0] == "all"
-    assert "not proof that Alexa was spoken" in ui.source_classification(acoustic)[1]
+    assert "does not verify Alexa was spoken or missed" in ui.source_classification(acoustic)[1]
     assert "not a verified wake" in ui.source_classification(other)[1]
 
 
+def test_wake_evidence_mode_includes_only_explicit_wake_provenance():
+    acoustic = {"candidate_kind": "acoustic_unconfirmed", "reason": "acoustic_unconfirmed",
+                "audio_field": "audio_path", "trigger_source": "near_miss", "scores": {}}
+    user_miss = {"audio_field": "audio_path", "trigger_source": "miss", "scores": {}}
+    accepted = {"audio_field": "audio_path", "trigger_source": "stt", "scores": {"wake": .1}}
+    accepted_zero = {"audio_field": "audio_path", "trigger_source": "command", "scores": {"wake": 0}}
+    generic = {"candidate_kind": "short_segment", "audio_field": "audio_path",
+               "trigger_source": "near_miss", "scores": {"wake": .99}}
+    wrong_audio = {**accepted, "audio_field": "retry_audio_path"}
+    wrong_miss_audio = {**user_miss, "audio_field": "follow_up_audio_path"}
+    for candidate in (acoustic, user_miss):
+        category, explanation = ui.source_classification(candidate)
+        assert ui._matches_mode(candidate, category, "wake_evidence")
+        if candidate is user_miss:
+            assert "not independently verified ground truth" in explanation
+        else:
+            assert "does not verify Alexa was spoken or missed" in explanation
+    for candidate in (generic, wrong_audio, wrong_miss_audio, accepted, accepted_zero):
+        category, _ = ui.source_classification(candidate)
+        assert not ui._matches_mode(candidate, category, "wake_evidence")
+    assert ui._matches_mode(generic, ui.source_classification(generic)[0], "possible_misses")
+
+
+def test_explicit_collection_is_unknown_reviewable_wake_evidence_only():
+    candidate = {"audio_field": "audio_path", "trigger_source": "wake_collection",
+                 "candidate_kind": "intentional_wake", "scores": {}}
+    category, explanation = ui.source_classification(candidate)
+    assert category == "collection"
+    assert "unknown until human review" in explanation
+    assert ui._matches_mode(candidate, category, "collection")
+    assert ui._matches_mode(candidate, category, "wake_evidence")
+    wrong_source = {**candidate, "trigger_source": "wake_rejected"}
+    wrong_kind = {**candidate, "candidate_kind": "acoustic_unconfirmed"}
+    wrong_field = {**candidate, "audio_field": "retry_audio_path"}
+    for row in (wrong_source, wrong_kind, wrong_field):
+        row_category, _ = ui.source_classification(row)
+        assert row_category != "collection"
+
+
+@pytest.mark.parametrize("bad_scores", [None, [], {"wake": True}, {"wake": float("nan")},
+                                         {"wake": float("inf")}, {"wake": "0.9"}])
+def test_accepted_source_is_omitted_until_wake_evidence_is_exported(bad_scores):
+    candidate = {"audio_field": "audio_path", "trigger_source": "command", "scores": bad_scores}
+    category, _ = ui.source_classification(candidate)
+    assert category == "all"
+    assert not ui._matches_mode(candidate, category, "wake_evidence")
+
+
+def test_malformed_candidate_fields_do_not_create_wake_provenance():
+    for candidate in (
+            {"audio_field": "audio_path", "trigger_source": ["miss"]},
+            {"audio_field": "audio_path", "trigger_source": "near_miss",
+             "candidate_kind": ["acoustic_unconfirmed"]},
+            {"audio_field": "audio_path", "trigger_source": "near_miss",
+             "reason": {"reason": "acoustic_unconfirmed"}}):
+        category, _ = ui.source_classification(candidate)
+        assert not ui._matches_mode(candidate, category, "wake_evidence")
+
+
+def test_finite_wake_score_does_not_qualify_an_accepted_candidate_by_itself():
+    candidate = {"audio_field": "audio_path", "trigger_source": "command", "scores": {"wake": .99}}
+    category, _ = ui.source_classification(candidate)
+    assert category == "all"
+    assert not ui._matches_mode(candidate, category, "wake_evidence")
+
+
 def test_mode_filter_runs_before_recent_cap(monkeypatch, tmp_path):
-    rows = [{"event_id": f"other-{i}", "audio_field": "audio_path", "path": "", "candidate_kind": "command", "trigger_source": "stt", "event_ts": NOW-i, "scores": {}} for i in range(5)]
+    rows = [{"event_id": f"other-{i}", "audio_field": "audio_path", "path": "", "candidate_kind": "command", "trigger_source": "stt", "event_ts": NOW-i, "scores": {"wake": .9}} for i in range(5)]
     rows += [{"event_id": f"miss-{i}", "audio_field": "audio_path", "path": "", "candidate_kind": "below_vad", "event_ts": NOW-20-i, "scores": {}} for i in range(3)]
     monkeypatch.setattr(review, "iter_candidates", lambda *args, **kwargs: iter(rows))
     selected = ui.recent_candidates(tmp_path / "telemetry", tmp_path, tmp_path, now=NOW, limit=2, selection="recent", mode="possible_misses")
     assert [row["event_id"] for row in selected] == ["miss-0", "miss-1"]
 
 
+def test_wake_evidence_filter_runs_before_cap(monkeypatch, tmp_path):
+    rows = [{"event_id": f"generic-{i}", "audio_field": "audio_path", "path": "",
+             "candidate_kind": "short_segment", "trigger_source": "near_miss",
+             "event_ts": NOW-i, "scores": {"wake": .99}} for i in range(5)]
+    rows += [{"event_id": f"miss-{i}", "audio_field": "audio_path", "path": "",
+              "trigger_source": "miss", "event_ts": NOW-20-i, "scores": {}} for i in range(3)]
+    monkeypatch.setattr(review, "iter_candidates", lambda *args, **kwargs: iter(rows))
+    selected = ui.recent_candidates(tmp_path / "telemetry", tmp_path, tmp_path,
+                                    now=NOW, limit=2, selection="recent", mode="wake_evidence")
+    assert [row["event_id"] for row in selected] == ["miss-0", "miss-1"]
+
+
 def test_default_mode_and_mode_queries_are_strict(state):
     default = ui.ReviewState(state.telemetry, state.audio_root, state.project_root, state.store, now=NOW)
-    assert default.mode == "possible_misses"
+    assert default.mode == "reported_misses"
     assert default.summary()["candidates"] == []
     with running(default) as server:
         for query in ("?mode=all", "?refresh=1&mode=bad", "?refresh=1&mode=all&mode=all", "?refresh=1&x=1"):
@@ -54,6 +133,57 @@ def test_default_mode_and_mode_queries_are_strict(state):
             assert status == 400
         status, _, body = request(server, path="/api/state?refresh=1&mode=all")
         assert status == 200 and json.loads(body)["mode"] == "all"
+        status, _, body = request(server, path="/api/state?refresh=1&mode=reported_misses")
+        state_body = json.loads(body)
+        assert status == 200 and state_body["mode"] == "reported_misses" and state_body["candidates"] == []
+        status, _, page = request(server, path="/")
+        assert status == 200 and b"No saved reports yet." in page
+        status, _, body = request(server, path="/api/state?refresh=1&mode=possible_misses")
+        assert status == 200 and json.loads(body)["mode"] == "possible_misses"
+        status, _, body = request(server, path="/api/state?refresh=1&mode=unconfirmed_hits")
+        assert status == 200 and json.loads(body)["mode"] == "unconfirmed_hits"
+
+
+def test_default_reported_misses_mode_isolated_from_optional_queues(state, monkeypatch):
+    explicit_path = wav_file(state.audio_root / "explicit-collection.wav")
+    rows = [
+        {"event_id": "acoustic", "audio_field": "audio_path", "path": str(state.audio_root / "recent.wav"),
+         "trigger_source": "wake_rejected", "candidate_kind": "acoustic_unconfirmed",
+         "event_ts": NOW - 1, "scores": {"wake": .99}, "capture_session_id": "diagnostic-session"},
+        {"event_id": "generic", "audio_field": "audio_path", "path": str(state.audio_root / "recent.wav"),
+         "trigger_source": "near_miss", "candidate_kind": "short_segment",
+         "event_ts": NOW - 2, "scores": {}, "capture_session_id": "diagnostic-session"},
+        {"event_id": "collected", "audio_field": "audio_path", "path": str(explicit_path),
+         "trigger_source": "wake_collection", "candidate_kind": "intentional_wake",
+         "event_ts": NOW - 3, "scores": {}, "capture_session_id": "user-session"},
+        {"event_id": "reported-miss", "audio_field": "audio_path", "path": str(state.audio_root / "recent.wav"),
+         "trigger_source": "miss", "candidate_kind": "user_reported_miss",
+         "event_ts": NOW - 4, "scores": {"wake": .01}, "capture_session_id": "reported-session"},
+        {"event_id": "wrong-field-miss", "audio_field": "trigger_audio_path", "path": str(state.audio_root / "recent.wav"),
+         "trigger_source": "miss", "candidate_kind": "user_reported_miss",
+         "event_ts": NOW - 5, "scores": {}, "capture_session_id": "reported-session"},
+    ]
+    monkeypatch.setattr(review, "iter_candidates", lambda *args, **kwargs: iter(rows))
+    state = ui.ReviewState(state.telemetry, state.audio_root, state.project_root, state.store, now=NOW)
+    default_cards = state.summary()["candidates"]
+    assert state.mode == "reported_misses"
+    assert [row["event_id"] for row in default_cards] == ["reported-miss"]
+    assert default_cards[0]["presence"] == "unknown" and default_cards[0]["available"]
+    assert default_cards[0]["session_seed"] == "reported-session"
+    assert "not independently verified ground truth" in default_cards[0]["source_explanation"]
+
+    state.refresh("collection")
+    collection_cards = state.summary()["candidates"]
+    assert [row["event_id"] for row in collection_cards] == ["collected"]
+    assert collection_cards[0]["presence"] == "unknown" and collection_cards[0]["session_seed"] == "user-session"
+
+    state.refresh("unconfirmed_hits")
+    acoustic_cards = state.summary()["candidates"]
+    assert [row["event_id"] for row in acoustic_cards] == ["acoustic"]
+    assert acoustic_cards[0]["presence"] == "unknown"
+    assert "does not verify Alexa was spoken or missed" in acoustic_cards[0]["source_explanation"]
+    state.refresh("possible_misses")
+    assert [row["event_id"] for row in state.summary()["candidates"]] == ["generic"]
 
 
 def test_played_label_survives_mode_change_and_undo_is_pinned(state):
@@ -122,8 +252,8 @@ def state(tmp_path):
 
 
 @contextmanager
-def running(state):
-    server = ui.create_server(state, 0)
+def running(state, **kwargs):
+    server = ui.create_server(state, 0, **kwargs)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     try:
@@ -149,12 +279,369 @@ def post_headers(server):
             "X-Review-Nonce": server.review_state.nonce, "Content-Type": "application/json"}
 
 
+class CollectionStub:
+    def __init__(self):
+        self.calls = []
+        self.used = set()
+
+    def create_session(self, condition):
+        self.calls.append(("session", condition))
+        return {"session_id": "a" * 32, "split": "train", "condition": condition,
+                "max_clips": 12, "clip_seconds": 4}
+
+    def arm(self, session_id):
+        self.calls.append(("arm", session_id))
+        if session_id != "a" * 32:
+            raise ValueError("unknown collection session")
+        return {"capture_id": "b" * 32, "sample_rate": 16000, "max_seconds": 4}
+
+    def ready(self, capture_id):
+        self.calls.append(("ready", capture_id))
+        return {"ready": capture_id == "b" * 32, "expired": False}
+
+    def submit(self, capture_id, wav_bytes):
+        self.calls.append(("clip", capture_id, wav_bytes))
+        if capture_id != "b" * 32 or capture_id in self.used:
+            raise ValueError("unknown, expired, or replayed collection capture")
+        self.used.add(capture_id)
+        return {"event_id": "event123", "saved": True, "indexed": True,
+                "session_id": "a" * 32, "split": "train", "review_state": "unknown"}
+
+    def cancel(self, capture_id):
+        self.calls.append(("cancel", capture_id))
+        if capture_id != "b" * 32 or capture_id in self.used:
+            raise ValueError("unknown, expired, or replayed collection capture")
+        self.used.add(capture_id)
+        return {"cancelled": True}
+
+
 def label_body(state, **changes):
     body = {"id": next(iter(state.candidates)), "presence": "negative",
             "wake_presence": "absent", "review_category": "room_sound",
             "review_note": "", "confirm_reviewed": True,
             "entire_clip_negative": True, **changes}
     return body
+
+
+def test_collection_endpoints_are_lazy_strict_nonce_bound_and_forward_bytes(state):
+    constructed = []
+    manager = CollectionStub()
+    def factory(_state):
+        constructed.append(True)
+        return manager
+
+    with running(state, collection_manager_factory=factory) as server:
+        status, _, _ = request(server, path="/")
+        assert status == 200 and constructed == []
+        status, _, body = request(server, "POST", "/api/collection/session",
+                                  json.dumps({"condition": "quiet", "extra": 1}), post_headers(server))
+        assert status == 400 and constructed == []
+        headers = post_headers(server)
+        headers["Origin"] = "http://example.invalid"
+        status, _, _ = request(server, "POST", "/api/collection/session",
+                               json.dumps({"condition": "quiet"}), headers)
+        assert status == 403 and constructed == []
+
+        status, _, body = request(server, "POST", "/api/collection/session",
+                                  '{"condition":"quiet","condition":"music"}', post_headers(server))
+        assert status == 400 and constructed == []
+        status, _, body = request(server, "POST", "/api/collection/session",
+                                  json.dumps({"condition": "quiet"}), post_headers(server))
+        assert status == 200 and json.loads(body)["split"] == "train" and len(constructed) == 1
+        status, _, _ = request(server, "POST", "/api/collection/arm",
+                               json.dumps({"session_id": "c" * 32}), post_headers(server))
+        assert status == 400
+        for path, payload, expected in (
+                ("/api/collection/arm", {"session_id": "a" * 32}, "arm"),
+                ("/api/collection/ready", {"capture_id": "b" * 32}, "ready"),
+                ("/api/collection/cancel", {"capture_id": "b" * 32}, "cancel")):
+            status, _, body = request(server, "POST", path, json.dumps(payload), post_headers(server))
+            assert status == 200
+            if expected == "ready":
+                assert json.loads(body) == {"ready": True, "expired": False}
+        status, _, body = request(server, "POST", "/api/collection/clip",
+                                  json.dumps({"capture_id": "b" * 32, "wav_base64": "%%%"}), post_headers(server))
+        assert status == 400
+
+    # A fresh manager gets a fresh single-use capture token for the accepted clip.
+    manager = CollectionStub()
+    with running(state, collection_manager_factory=lambda _state: manager) as server:
+        payload = {"capture_id": "b" * 32, "wav_base64": "d2F2LWRhdGE="}
+        status, _, body = request(server, "POST", "/api/collection/clip", json.dumps(payload), post_headers(server))
+        assert status == 200 and json.loads(body)["review_state"] == "unknown"
+        assert ("clip", "b" * 32, b"wav-data") in manager.calls
+        status, _, _ = request(server, "POST", "/api/collection/clip", json.dumps(payload), post_headers(server))
+        assert status == 400
+
+
+def test_collection_clip_limit_is_separate_from_review_limit(state):
+    import base64
+
+    with running(state, collection_manager_factory=lambda _state: CollectionStub()) as server:
+        headers = post_headers(server)
+        body = " " * (ui.MAX_COLLECTION_REQUEST_BYTES + 1)
+        status, _, _ = request(server, "POST", "/api/collection/clip", body, headers)
+        assert status == 413
+        body = json.dumps({"capture_id": "b" * 32,
+                           "wav_base64": base64.b64encode(b"x" * (ui.MAX_COLLECTION_WAV_BYTES + 1)).decode("ascii")})
+        status, _, _ = request(server, "POST", "/api/collection/clip", body, headers)
+        assert status == 400
+        body = " " * (ui.MAX_BODY_BYTES + 1)
+        status, _, _ = request(server, "POST", "/api/label", body, headers)
+        assert status == 413
+
+
+def test_collection_manager_factory_is_singleton_under_concurrent_first_posts(state):
+    created = []
+    manager = CollectionStub()
+    def factory(_state):
+        created.append(True)
+        time.sleep(0.05)
+        return manager
+
+    with running(state, collection_manager_factory=factory) as server:
+        barrier = threading.Barrier(3)
+        results = []
+        def create_session(condition):
+            barrier.wait()
+            results.append(request(server, "POST", "/api/collection/session",
+                                  json.dumps({"condition": condition}), post_headers(server))[0])
+        workers = [threading.Thread(target=create_session, args=(condition,))
+                   for condition in ("quiet", "noise")]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=3)
+    assert results == [200, 200]
+    assert len(created) == 1
+    assert [call[0] for call in manager.calls] == ["session", "session"]
+
+
+def test_collection_default_factory_uses_separate_collection_text_log(state, monkeypatch):
+    captured = {}
+    class ConfigStub:
+        def __init__(self, data):
+            self._data = data
+            captured["data"] = data
+    class TelemetryStub:
+        def __init__(self, cfg):
+            captured["config"] = cfg
+    class ManagerStub:
+        def __init__(self, telemetry, lease_dir):
+            captured["telemetry"] = telemetry
+            captured["lease_dir"] = lease_dir
+
+    from assistant import config, telemetry
+    from assistant.experimental.wake_train import collection
+    monkeypatch.setattr(config, "Config", ConfigStub)
+    monkeypatch.setattr(config, "load", lambda: ConfigStub({"telemetry": {
+        "text_log_path": "old.log", "max_audio_mb": 10,
+    }, "audio": {}}))
+    monkeypatch.setattr(telemetry, "Telemetry", TelemetryStub)
+    monkeypatch.setattr(collection, "CollectionManager", ManagerStub)
+    result = ui._default_collection_manager(state)
+    data = captured["data"]
+    assert isinstance(result, ManagerStub)
+    assert data["telemetry"]["jsonl_path"] == str(state.telemetry)
+    assert data["telemetry"]["audio_dir"] == str(state.audio_root)
+    assert data["telemetry"]["text_log_path"] == str(state.telemetry.with_name("collection.log"))
+    assert data["telemetry"]["max_audio_mb"] == 10
+    assert data["audio"]["sample_rate"] == 16000
+    assert captured["lease_dir"] == state.project_root / "assistant" / "logs" / "collection_pauses"
+
+
+def test_collection_ui_is_explicit_and_uses_worklet_at_fixed_rate():
+    page = ui.PAGE.replace("__NONCE__", "null")
+    assert 'id="collection-condition"' in page
+    assert "New recording session" in page and "Record Alexa (4 seconds)" in page
+    assert "separate occasions" in page and "does not make an independent holdout" in page
+    assert "navigator.mediaDevices.getUserMedia" in page
+    assert "AudioWorkletNode" in page and "AudioContext({sampleRate:16000})" in page
+    assert "echoCancellation:false" in page and "noiseSuppression:false" in page and "autoGainControl:false" in page
+    assert "context.sampleRate!==16000" in page and "64000" in page
+    assert "ScriptProcessor" not in page
+    assert "load();</script>" in page
+
+
+def test_collection_browser_attempt_owns_resources_and_bounds_async_lifecycle():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is not installed")
+    inline = ui.PAGE.replace("__NONCE__", "null").split("<script>", 1)[1].split("</script>", 1)[0]
+    start = inline.index("const collectionStatus=")
+    end = inline.index("document.querySelector('#mode').addEventListener")
+    collection_script = inline[start:end]
+    harness = r"""
+const assert=require('node:assert/strict');
+const nonce=null;
+class Element{
+ constructor(id){this.id=id;this.value=id==='collection-condition'?'quiet':'';this.disabled=false;this.textContent='';this.listeners={};}
+ addEventListener(name,fn){(this.listeners[name]??=[]).push(fn);}
+ async click(){if(this.disabled)return;for(const fn of this.listeners.click||[])await fn();}
+}
+const ids={};for(const id of ['collection-status','collection-session','collection-record','collection-condition','mode'])ids[id]=new Element(id);
+const visibility=[];global.document={hidden:false,querySelector:s=>ids[s.slice(1)],addEventListener:(name,fn)=>{if(name==='visibilitychange')visibility.push(fn);}};
+global.window={};global.load=async()=>{};
+let streamIndex=0,streams=[],contexts=[],nodes=[],permissionQueue=[],emitOnStart=true,hangClip=false,invalidClipJson=false,wrongClipReceipt=false,keepSuspended=false,clipWaiters=[],armStates=[],workletSource='',registeredProcessor=null;
+function makeStream(label){const track={label,stopped:false,stop(){this.stopped=true;}};const stream={label,track,getTracks:()=>[track],getAudioTracks:()=>[track]};streams.push(stream);return stream;}
+Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:()=>permissionQueue.shift()}}});
+class FakeAudioContext{
+ constructor(options){this.sampleRate=options.sampleRate;this.state='suspended';this.resumeCalls=0;this.closed=false;this.audioWorklet={addModule:async()=>{new Function('AudioWorkletProcessor','registerProcessor',workletSource)(FakeAudioWorkletProcessor,global.registerProcessor);}};this.destination={};contexts.push(this);}
+ async resume(){this.resumeCalls++;if(!keepSuspended)this.state='running';}
+ async close(){this.closed=true;this.state='closed';}
+ createMediaStreamSource(){return {connect(){},disconnect(){}};}
+ createGain(){return {gain:{value:1},connect(){},disconnect(){}};}
+}
+class FakeAudioWorkletProcessor{constructor(){this.emitted=[];this.port={onmessage:null,postMessage:chunk=>this.emitted.push(chunk.length)};}}
+class FakeAudioWorkletNode{
+ constructor(){this.disconnected=false;this.port={onmessage:null,postMessage:value=>{if(value==='start'&&emitOnStart)setImmediate(()=>this.port.onmessage?.({data:new Float32Array(64000).fill(.25)}));}};nodes.push(this);}
+ connect(){} disconnect(){this.disconnected=true;}
+}
+global.AudioContext=FakeAudioContext;global.AudioWorkletNode=FakeAudioWorkletNode;window.AudioContext=FakeAudioContext;window.AudioWorkletNode=FakeAudioWorkletNode;
+global.AudioWorkletProcessor=FakeAudioWorkletProcessor;global.registerProcessor=(_name,processor)=>{registeredProcessor=processor;};
+global.Blob=class{constructor(parts){this.source=parts.join('');}};
+global.URL={createObjectURL:blob=>{workletSource=blob.source;return 'blob:worklet';},revokeObjectURL(){}};
+global.btoa=value=>Buffer.from(value,'binary').toString('base64');
+const ok=data=>({ok:true,json:async()=>data});
+global.fetch=async(path,options={})=>{
+ const body=options.body?JSON.parse(options.body):{};
+ if(path==='/api/collection/session')return ok({session_id:`${++streamIndex}`.padStart(32,'a'),split:'train',condition:body.condition,max_clips:12,clip_seconds:4});
+ if(path==='/api/collection/arm'){armStates.push(contexts.at(-1).state);return ok({capture_id:`${streamIndex}`.padStart(32,'b')});}
+ if(path==='/api/collection/ready')return ok({ready:true,expired:false});
+ if(path==='/api/collection/cancel')return ok({cancelled:true});
+ if(path==='/api/collection/clip'){
+  if(invalidClipJson)return {ok:true,json:async()=>{throw Error('truncated response');}};
+  if(wrongClipReceipt)return ok({event_id:'wrong-session-event',split:'train',saved:true,indexed:true,review_state:'unknown',session_id:'wrong-session'});
+  const result=ok({event_id:`clip-${streamIndex}`,split:'train',saved:true,indexed:true,review_state:'unknown',session_id:String(streamIndex).padStart(32,'a')});
+  if(!hangClip)return result;
+  return new Promise((resolve,reject)=>{
+   const abort=()=>reject(new Error('aborted'));
+   options.signal.addEventListener('abort',abort,{once:true});
+   clipWaiters.push({resolve:()=>{options.signal.removeEventListener('abort',abort);resolve(result);},signal:options.signal,body});
+  });
+ }
+ throw Error(`unexpected fetch ${path}`);
+};
+const source=require('node:fs').readFileSync(0,'utf8');new Function(source)();
+const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
+async function waitFor(test,label='collection state'){for(let i=0;i<100;i++){if(test())return;await tick();}throw Error(`timed out waiting for ${label}; status=${ids['collection-status'].textContent}`);}
+(async()=>{
+ await ids['collection-session'].click();assert.equal(ids['collection-record'].disabled,false);
+ keepSuspended=true;permissionQueue.push(Promise.resolve(makeStream('Suspended microphone')));
+ void ids['collection-record'].click();
+ await waitFor(()=>ids['collection-status'].textContent.includes('did not enter the running state'),'suspended context refusal');
+ assert.deepEqual(armStates,[],'capture must not arm while the context remains suspended');
+ assert.equal(streams[0].track.stopped,true,'unsupported context setup releases its own stream');
+ keepSuspended=false;await ids['collection-session'].click();
+ permissionQueue.push(Promise.resolve(makeStream('Initial microphone')));
+ hangClip=true;emitOnStart=true;void ids['collection-record'].click();
+ await waitFor(()=>clipWaiters.length===1,'first clip upload');
+ const boundedProcessor=new registeredProcessor();boundedProcessor.port.onmessage({data:'start'});
+ for(let frame=0;frame<600;frame++)boundedProcessor.process([[new Float32Array(128).fill(.1)]]);
+ assert.equal(boundedProcessor.emitted.reduce((sum,count)=>sum+count,0),64000,'processor itself stops emitting at 64000 samples');
+ assert.equal(boundedProcessor.emitted.at(-1),128,'processor emits full frames up to its cap');
+ boundedProcessor.port.onmessage({data:'start'});boundedProcessor.process([[new Float32Array(128).fill(.1)]]);
+ assert.equal(boundedProcessor.emitted.reduce((sum,count)=>sum+count,0),64128,'a new explicit start gets its own bounded sample budget');
+ assert.equal(contexts[1].resumeCalls,1);assert.deepEqual(armStates,['running']);
+ assert.equal(streams[1].track.stopped,true,'capture tracks stop before the upload request');
+ assert.equal(contexts[1].closed,true,'audio context closes before the upload request');
+ assert.equal(ids['collection-session'].disabled,true,'new sessions stay disabled during upload');
+ assert.equal(ids['collection-record'].disabled,true,'a second capture cannot start during upload');
+ document.hidden=true;for(const listener of visibility)listener();document.hidden=false;
+ assert.equal(clipWaiters[0].signal.aborted,true,'tab hide aborts the in-flight upload request');
+ assert.match(ids['collection-status'].textContent,/Save unconfirmed; refresh the collection queue/);
+ await waitFor(()=>!ids['collection-session'].disabled,'first cancellation release');
+ await ids['collection-session'].click();
+ const latePermission={};latePermission.promise=new Promise(resolve=>latePermission.resolve=resolve);
+ permissionQueue.push(latePermission.promise);emitOnStart=false;
+ void ids['collection-record'].click();
+ await waitFor(()=>ids['collection-status'].textContent.startsWith('Requesting microphone access'),'second permission pending');
+ document.hidden=true;for(const listener of visibility)listener();document.hidden=false;
+ await waitFor(()=>!ids['collection-session'].disabled,'second cancellation release');
+ await ids['collection-session'].click();
+ const currentStream=makeStream('Laptop microphone');permissionQueue.push(Promise.resolve(currentStream));
+ void ids['collection-record'].click();
+ await waitFor(()=>nodes.length===2&&ids['collection-status'].textContent.startsWith('Recording now.'),'current recording ready');
+ const statusBeforeLatePermission=ids['collection-status'].textContent;
+ const lateStream=makeStream('Late microphone');latePermission.resolve(lateStream);await tick();await tick();
+ assert.equal(lateStream.track.stopped,true,'late permission result stops its own stream');
+ assert.equal(currentStream.track.stopped,false,'late result cannot stop the current attempt stream');
+ assert.equal(ids['collection-status'].textContent,statusBeforeLatePermission,'stale attempt cannot overwrite current status');
+ assert.equal(ids['collection-session'].disabled,true,'stale finally cannot unlock a current attempt');
+ nodes.at(-1).port.onmessage({data:new Float32Array(64000).fill(.25)});
+ await waitFor(()=>clipWaiters.length===2,'second clip upload');
+ assert.equal(currentStream.track.stopped,true,'current capture also stops before its upload');
+ clipWaiters[1].resolve();await waitFor(()=>ids['collection-status'].textContent.startsWith('Saved unlabelled recording'),'second upload completion');
+ await ids['collection-session'].click();
+ const malformedResponseStream=makeStream('Response-check microphone');permissionQueue.push(Promise.resolve(malformedResponseStream));
+ emitOnStart=true;invalidClipJson=true;void ids['collection-record'].click();
+ await waitFor(()=>ids['collection-status'].textContent.startsWith('Save unconfirmed; refresh the collection queue'),'invalid upload receipt');
+ assert.equal(malformedResponseStream.track.stopped,true,'invalid upload receipt is reported after stopping capture');
+ assert.equal(ids['collection-status'].textContent.includes('undefined'),false,'invalid receipt is not reported as a successful undefined event');
+ await ids['collection-session'].click();
+ const wrongReceiptStream=makeStream('Receipt-check microphone');permissionQueue.push(Promise.resolve(wrongReceiptStream));
+ emitOnStart=true;invalidClipJson=false;wrongClipReceipt=true;void ids['collection-record'].click();
+ await waitFor(()=>ids['collection-status'].textContent.startsWith('Save unconfirmed; refresh the collection queue'),'wrong-session receipt');
+ assert.equal(ids['collection-status'].textContent.includes('Saved unlabelled recording'),false,'wrong-session receipt never produces success feedback');
+ assert.equal(wrongReceiptStream.track.stopped,true,'wrong-session receipt is checked after capture cleanup');
+ console.log('collection browser lifecycle passed');
+})().catch(error=>{console.error(error.stack||error);process.exitCode=1;});
+"""
+    result = subprocess.run([node, "-e", harness], input=collection_script, text=True,
+                            capture_output=True, timeout=12, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "collection browser lifecycle passed" in result.stdout
+
+
+def test_http_collection_flows_into_unknown_explicit_review_candidate(state, tmp_path, monkeypatch):
+    import base64
+
+    from assistant.config import Config
+    from assistant.telemetry import Telemetry
+    from assistant.experimental.wake_train import collection
+
+    monkeypatch.setattr(Telemetry, "_setup_text_log", lambda _self, _cfg: None)
+    telemetry_path = tmp_path / "assistant" / "logs" / "telemetry.jsonl"
+    state.telemetry = telemetry_path
+    cfg = Config({"telemetry": {
+        "jsonl_path": str(telemetry_path), "text_log_path": str(tmp_path / "collection.log"),
+        "audio_dir": str(state.audio_root), "archive_audio": True,
+        "max_audio_mb": 20, "max_near_miss_mb": 2,
+    }, "audio": {"sample_rate": 16000}})
+    telemetry = Telemetry(cfg)
+    monkeypatch.setattr(collection.runtime, "create_collection_pause", lambda *_a, **_k: None)
+    monkeypatch.setattr(collection.runtime, "collection_pause_acknowledged", lambda *_a, **_k: True)
+    monkeypatch.setattr(collection.runtime, "release_collection_pause", lambda *_a, **_k: True)
+    manager = collection.CollectionManager(telemetry, tmp_path / "pauses", clock=lambda: NOW)
+
+    with running(state, collection_manager_factory=lambda _state: manager) as server:
+        status, _, response = request(server, "POST", "/api/collection/session",
+                                      json.dumps({"condition": "music"}), post_headers(server))
+        assert status == 200
+        session = json.loads(response)
+        status, _, response = request(server, "POST", "/api/collection/arm",
+                                      json.dumps({"session_id": session["session_id"]}), post_headers(server))
+        assert status == 200
+        capture = json.loads(response)
+        status, _, response = request(server, "POST", "/api/collection/ready",
+                                      json.dumps({"capture_id": capture["capture_id"]}), post_headers(server))
+        assert status == 200 and json.loads(response) == {"ready": True, "expired": False}
+        wav_bytes = wav_file(tmp_path / "collection-input.wav", samples=8000).read_bytes()
+        payload = {"capture_id": capture["capture_id"], "wav_base64": base64.b64encode(wav_bytes).decode("ascii")}
+        status, _, response = request(server, "POST", "/api/collection/clip",
+                                      json.dumps(payload), post_headers(server))
+        assert status == 200 and json.loads(response)["review_state"] == "unknown"
+        status, _, response = request(server, path="/api/state?refresh=1&mode=collection")
+        assert status == 200
+        candidates = json.loads(response)["candidates"]
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate["source_classification"] == "collection"
+        assert candidate["presence"] == "unknown" and candidate["available"]
+        assert candidate["session_seed"] == session["session_id"]
+        assert candidate["duration_seconds"] == 0.5
+        assert not state.store.exists()
 
 
 def historical_positive(state):
@@ -207,9 +694,22 @@ def test_review_page_has_simple_one_tap_labels_and_source_choices(state):
     assert b"aria-pressed','false'" in page and b"button[aria-pressed=\"true\"]" in page
     assert b"button:focus-visible" in page and b"classList.toggle('selected',selected)" in page
     assert b"Other sound (max 500 characters)" in page
-    assert b'id="mode"' in page and b"Short / quiet speech" in page and b"Unconfirmed wake hits" in page
-    assert b"not confirmed missed Alexas" in page
-    assert "wake confirmation rejected it" in card["source_explanation"]
+    assert b"<h1>Voice reports</h1>" in page
+    assert b"After a miss or false wake, press Ctrl+Alt+M. Hear \xe2\x80\x9cSaved for review.\xe2\x80\x9d, then refresh." in page
+    assert b">Refresh</button>" in page
+    assert b"No saved reports yet." in page
+    assert b'id="advanced" class="card"><summary>Advanced</summary>' in page
+    assert b'<summary>Help</summary>' in page
+    assert b"Ctrl+Alt+Space starts command listening; it does not save a prior report" in page
+    assert b'id="mode"' in page and b"Short / quiet audio diagnostics" in page and b"Unconfirmed acoustic proposals" in page
+    assert b"The default queue contains only clips you marked" not in page
+    assert b'<select id="mode"><option value="reported_misses">Misses you marked</option>' in page
+    assert b'optgroup label="Optional detector diagnostics (not verified misses)"' in page
+    assert b'<details id="source-metadata" hidden>' in page
+    assert b'#card section.card>p:first-of-type{display:none}' in page
+    assert b'<details aria-labelledby="collection-heading">' in page
+    assert b'<summary id="collection-heading">Optional training recording</summary>' in page
+    assert "does not verify Alexa was spoken or missed" in card["source_explanation"]
     assert b"el('button','Play')" in page and b"play.textContent='Pause'" in page
     assert b"Previous review" in page and b"Next review" in page
     assert b"Review ${index+1} of ${reviewable.length}" in page
@@ -269,12 +769,12 @@ class Element{
  querySelector(sel){if(sel==='.status'){let found=null;const visit=node=>{for(const c of node.children){if((c.className||'').split(' ').includes('status')&&!found)found=c;visit(c);}};visit(this);return found;}return this.querySelectorAll(sel)[0]||null;}
 }
 class Audio extends Element{constructor(){super('audio');this.failNext=false;}setRanges(ranges){this.played={length:ranges.length,start:i=>ranges[i][0],end:i=>ranges[i][1]};}play(){if(this.failNext){this.failNext=false;return Promise.reject(Error('denied'));}this.paused=false;this.dispatch('play');this.dispatch('playing');return Promise.resolve();}pause(){this.paused=true;this.dispatch('pause');}}
-const ids={};for(const id of ['refresh','refresh-status','summary','undo-review','undo-status','action-status','card','mode']){ids[id]=new Element(id==='card'?'main':id==='mode'?'select':'button');ids[id].id=id;}ids.mode.value='possible_misses';
-const document={createElement:tag=>tag==='audio'?new Audio():new Element(tag),querySelector:s=>ids[s.slice(1)]};
+const ids={};for(const id of ['refresh','refresh-status','summary','undo-review','undo-status','action-status','card','mode','collection-status','collection-condition','collection-session','collection-record','advanced','source-metadata','source-metadata-text','help']){ids[id]=new Element(id==='card'?'main':id==='mode'||id==='collection-condition'?'select':'button');ids[id].id=id;}ids.mode.value='possible_misses';
+const document={createElement:tag=>tag==='audio'?new Audio():new Element(tag),querySelector:s=>ids[s.slice(1)],addEventListener(){}};
 global.document=document;global.window={confirm:()=>true};global.MutationObserver=class{constructor(callback){this.callback=callback;}observe(target){this.target=target;listeners.push(this);}};
-const candidates=['one','two'].map((id,i)=>({id,event_id:id,audio_field:'audio_path',reason:'reason '+id+'; Short / quiet speech; may include room noise, songs or genuine missed wakes.',ts:1791300000-i,session_seed:'session',available:true,wav_sha256:'a'.repeat(64),duration_seconds:1}));
-const state={candidates,reviewed_counts:{positive:0,negative:0,unsure:0},readiness:{data_eligible:false,resource_admission_checked:false,blocked_reasons:['missing train positive session groups','missing holdout positive session groups']},training_started:false,latest_review:null};
-let failLabel=false;const requested=[],labelBodies=[];global.fetch=async(url,options={})=>{requested.push(url);if(url==='/api/label')labelBodies.push(JSON.parse(options.body));const response={ok:url!=='/api/label'||!failLabel,json:async()=>url==='/api/label'?(failLabel?{error:'temporary failure'}:{presence:'unsure'}):state};response.clone=()=>({json:response.json});return response;};
+const candidates=['one','two'].map((id,i)=>({id,event_id:id,audio_field:'audio_path',reason:'reason '+id+'; Unverified short / quiet diagnostic audio; it may be ordinary room activity or a missed wake.',ts:1791300000-i,session_seed:'session',available:true,wav_sha256:'a'.repeat(64),duration_seconds:1}));
+const state={candidates,mode:'possible_misses',reviewed_counts:{positive:0,negative:0,unsure:0},readiness:{data_eligible:false,resource_admission_checked:false,blocked_reasons:['missing train positive session groups','missing holdout positive session groups']},training_started:false,latest_review:null};
+let failLabel=false;const requested=[],labelBodies=[];global.fetch=async(url,options={})=>{requested.push(url);if(url.startsWith('/api/state?refresh=1&mode='))state.mode=decodeURIComponent(url.split('mode=')[1]);if(url==='/api/label')labelBodies.push(JSON.parse(options.body));const response={ok:url!=='/api/label'||!failLabel,json:async()=>url==='/api/label'?(failLabel?{error:'temporary failure'}:{presence:'unsure'}):state};response.clone=()=>({json:response.json});return response;};
 const source=require('node:fs').readFileSync(0,'utf8');new Function(source)();
 const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
 async function waitFor(test){for(let i=0;i<50;i++){if(test())return;await tick();}throw Error('timed out waiting for UI render');}
@@ -282,9 +782,11 @@ const all=(root,tag)=>{const out=[];const visit=n=>{for(const c of n.children){i
 const find=(root,text)=>all(root,'button').find(b=>b.textContent===text);
 (async()=>{
  await waitFor(()=>ids.card.children.length>0);await waitFor(()=>find(ids.card,'Save confirmed Alexa span'));assert.equal(ids.card.children[0].tagName,'SECTION');assert.equal(ids.card.children[0].localName,'section');
+ assert.equal(ids['source-metadata-text'].textContent,state.candidates[0].reason,'recording source metadata is available under Advanced');
  ids.mode.value='all';await ids.mode.dispatch('change');await waitFor(()=>requested.includes('/api/state?refresh=1&mode=all'));assert.equal(ids.mode.value,'all');
  assert.equal(ids.card.textContent.includes('Review 1 of 2'),true);
- assert.equal(ids.card.textContent.includes('Short / quiet speech; may include room noise, songs or genuine missed wakes.'),true,'source explanation is visible in the card');
+ assert.equal(ids.card.textContent.includes('Unverified short / quiet diagnostic audio; it may be ordinary room activity or a missed wake.'),true,'source explanation remains available in the rendered card DOM');
+ assert.equal(ids['source-metadata-text'].textContent,candidates[0].reason,'source text is copied into Advanced details');
  let previous=find(ids.card,'Previous review'),next=find(ids.card,'Next review');assert.equal(previous.disabled,true);assert.equal(next.disabled,false);
  const room=find(ids.card,'Room sound');await room.click();assert.equal(room.getAttribute('aria-pressed'),'true');assert.equal(room.classList.contains('selected'),true);assert.equal(all(ids.card,'label')[0].hidden,true);
  await next.click();await waitFor(()=>ids.card.textContent.includes('Review 2 of 2'));assert.equal(ids.card.textContent.includes('reason two'),true);previous=find(ids.card,'Previous review');next=find(ids.card,'Next review');assert.equal(previous.disabled,false);assert.equal(next.disabled,true);
@@ -962,6 +1464,42 @@ def test_cross_site_get_cannot_read_page_nonce_or_recording(state):
     assert not state.store.exists()
 
 
+def test_health_identity_is_lightweight_and_uses_get_origin_boundary(state, monkeypatch):
+    monkeypatch.setattr(state, "summary", lambda: pytest.fail("health must not scan review state"))
+    with running(state) as server:
+        status, _, body = request(server, path="/health")
+        assert status == 200
+        assert json.loads(body) == {"service": "smartalexa-wake-review", "version": 1}
+        status, _, _ = request(server, path="/health?detail=1")
+        assert status == 400
+        status, _, _ = request(server, path="/health", headers={"Origin": "https://example.invalid"})
+        assert status == 403
+
+
+def test_strict_port_refuses_fallback_when_requested_port_is_occupied(state):
+    with running(state) as occupied:
+        with pytest.raises(OSError):
+            ui.create_server(state, occupied.server_port, strict_port=True)
+
+
+def test_strict_port_cli_is_forwarded_to_server_factory(state, monkeypatch):
+    received = {}
+    class ServerStub:
+        server_port = 8767
+        def serve_forever(self):
+            raise KeyboardInterrupt
+        def server_close(self):
+            received["closed"] = True
+
+    monkeypatch.setattr(ui, "ReviewState", lambda *_args, **_kwargs: state)
+    def create_stub(review_state, port, *, strict_port=False):
+        received.update(review_state=review_state, port=port, strict_port=strict_port)
+        return ServerStub()
+    monkeypatch.setattr(ui, "create_server", create_stub)
+    ui.main(["--port", "8767", "--strict-port"])
+    assert received == {"review_state": state, "port": 8767, "strict_port": True, "closed": True}
+
+
 def test_stable_port_falls_back_only_to_loopback(state):
     with running(state) as occupied:
         fallback = ui.create_server(state, occupied.server_port)
@@ -1048,6 +1586,7 @@ def test_rate_suppressed_decision_is_visible_but_not_labelable(state):
     state.telemetry.write_text(json.dumps({"event_id": "suppressed", "ts": NOW - 10,
         "candidate_kind": "below_vad", "audio_reason": "audio_rate_limited"}) + "\n", encoding="utf-8")
     refreshed = ui.ReviewState(state.telemetry, state.audio_root, state.project_root, state.store, now=NOW)
+    refreshed.refresh("possible_misses")
     card = refreshed.summary()["candidates"][0]
     assert not card["available"] and card["presence"] == "unknown"
     assert card["unavailable"] == "Recording unavailable: audio_rate_limited"

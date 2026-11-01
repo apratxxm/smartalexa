@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -149,14 +150,35 @@ def build_plain_interpretation_messages(case: EvalCase) -> list[dict[str, str]]:
 
 
 def _safe_result(case: EvalCase, passed: bool, failure: str | None,
-                 decision: Decision | None, latency_ms: float) -> dict[str, Any]:
-    return {
+                 decision: Decision | None, latency_ms: float,
+                 diagnostics: dict[str, str | None] | None = None) -> dict[str, Any]:
+    result = {
         "case_id": case.case_id,
         "passed": passed,
         "failure_category": failure,
         "kind": decision.kind if decision else None,
         "capabilities": [step.capability for step in decision.steps] if decision else [],
         "latency_ms": round(latency_ms, 1),
+    }
+    if diagnostics:
+        result.update(diagnostics)
+    return result
+
+
+def _interpreter_failure_diagnostics(code: Any, validation_error: Any) -> dict[str, str | None]:
+    safe_code = (code if isinstance(code, str)
+                 and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code)
+                 else "unclassified")
+    if validation_error is None:
+        safe_validation_error = None
+    elif (isinstance(validation_error, str) and len(validation_error) <= 120
+          and all(ord(char) >= 32 and ord(char) != 127 for char in validation_error)):
+        safe_validation_error = validation_error
+    else:
+        safe_validation_error = "contract_invalid"
+    return {
+        "interpreter_error_code": safe_code,
+        "interpreter_validation_error": safe_validation_error,
     }
 
 
@@ -195,14 +217,18 @@ def evaluate(brain: Any, *, max_cases: int = 40, total_deadline: float = 120.0,
         decision = None
         failure = None
         stop_batch = False
+        diagnostics = None
         try:
             decision = brain.decide(turn, case.context)
             failure = check_decision(case, decision)
         except InterpreterUnavailable:
             failure = "interpreter_unavailable"
+            diagnostics = {"interpreter_error_code": "interpreter_unavailable"}
             stop_batch = True
-        except InterpreterFailure:
+        except InterpreterFailure as exc:
             failure = "interpreter_failure"
+            diagnostics = _interpreter_failure_diagnostics(
+                getattr(exc, "code", None), getattr(exc, "validation_error", None))
         finally:
             if original_timeout is not None:
                 brain.timeout = original_timeout
@@ -210,7 +236,8 @@ def evaluate(brain: Any, *, max_cases: int = 40, total_deadline: float = 120.0,
         if elapsed > case_budget:
             failure = "deadline_exceeded"
         result_decision = decision if failure not in {"interpreter_unavailable", "interpreter_failure"} else None
-        results.append(_safe_result(case, failure is None, failure, result_decision, elapsed * 1000))
+        results.append(_safe_result(case, failure is None, failure, result_decision,
+                                    elapsed * 1000, diagnostics))
         if stop_batch:
             break
     return results

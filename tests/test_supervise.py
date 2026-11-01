@@ -117,6 +117,9 @@ def test_process_lifetime_is_installed_before_server_or_assistant_spawn(monkeypa
     monkeypatch.setattr(supervise, "ensure_local_ollama",
                         lambda: events.append("server"))
 
+    monkeypatch.setattr(supervise, "ensure_review_server",
+                        lambda: events.append("review"))
+
     class Child:
         def wait(self, timeout=None):
             return 0
@@ -124,5 +127,5 @@ def test_process_lifetime_is_installed_before_server_or_assistant_spawn(monkeypa
     monkeypatch.setattr(supervise.subprocess, "Popen",
                         lambda *args, **kwargs: events.append("assistant") or Child())
     supervise.main()
-    assert events == ["install", "server", "assistant"]
+    assert events == ["install", "review", "server", "assistant"]
 

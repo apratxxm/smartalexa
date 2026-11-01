@@ -84,6 +84,32 @@ def _safe_tag_text(value: Any, limit: int) -> bool:
             and not any(ord(char) < 32 or ord(char) == 127 for char in value))
 
 
+def _safe_exception_category(exc: BaseException) -> str:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, InterpreterFailure):
+        return "interpreter_failure"
+    if isinstance(exc, InterpreterUnavailable):
+        return "interpreter_unavailable"
+    return "transport_failure"
+
+
+def _validate_probe_configuration(url: str, model: str, max_cases: int,
+                                  total_deadline: float, per_case_deadline: float) -> str:
+    base_url = _loopback_base_url(url)
+    if not _safe_tag_text(model, 200) or not model.strip():
+        raise ValueError("model must be an explicit installed model tag")
+    if (isinstance(total_deadline, bool) or not isinstance(total_deadline, (int, float))
+            or not math.isfinite(total_deadline) or not 0 < total_deadline <= _MAX_PROBE_SECONDS):
+        raise ValueError("total deadline must be >0 and <=120 seconds")
+    if (isinstance(per_case_deadline, bool) or not isinstance(per_case_deadline, (int, float))
+            or not math.isfinite(per_case_deadline) or not 0 < per_case_deadline <= _MAX_CASE_SECONDS):
+        raise ValueError("per-case deadline must be >0 and <=3 seconds")
+    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or not 1 <= max_cases <= 40:
+        raise ValueError("max cases must be 1..40")
+    return base_url
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject every redirect so a loopback URL cannot pivot to another host."""
 
@@ -466,11 +492,16 @@ class _RecordingNativeDiagnostic(NativeDecisionDiagnostic):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.admission_records: list[NativeAdmissionProof | None] = []
+        self.stop_condition: str | None = None
 
     def decide(self, transcript: Transcript, context: dict[str, Any] | None = None) -> Decision:
         self.last_admission = None
+        self.stop_condition = None
         try:
             return super().decide(transcript, context)
+        except InterpreterUnavailable:
+            self.stop_condition = "interpreter_unavailable"
+            raise
         finally:
             self.admission_records.append(self.last_admission)
 
@@ -479,22 +510,15 @@ def run_native_probe(*, url: str, model: str, max_cases: int = 40,
                      total_deadline: float = _MAX_PROBE_SECONDS,
                      per_case_deadline: float = _MAX_CASE_SECONDS,
                      held_out: bool = False,
-                     request_json: Callable[[str, dict[str, Any] | None, float], dict[str, Any]] | None = None
+                     request_json: Callable[[str, dict[str, Any] | None, float], dict[str, Any]] | None = None,
+                     on_metadata: Callable[[dict[str, Any]], None] | None = None,
+                     on_case: Callable[[dict[str, Any]], None] | None = None,
                      ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Run the opt-in native diagnostic against one local Ollama server."""
-    base_url = _loopback_base_url(url)
-    if not _safe_tag_text(model, 200) or not model.strip():
-        raise ValueError("model must be an explicit installed model tag")
-    if (isinstance(total_deadline, bool) or not isinstance(total_deadline, (int, float))
-            or not math.isfinite(total_deadline) or not 0 < total_deadline <= _MAX_PROBE_SECONDS):
-        raise ValueError("total deadline must be >0 and <=120 seconds")
-    if (isinstance(per_case_deadline, bool) or not isinstance(per_case_deadline, (int, float))
-            or not math.isfinite(per_case_deadline) or not 0 < per_case_deadline <= _MAX_CASE_SECONDS):
-        raise ValueError("per-case deadline must be >0 and <=3 seconds")
-    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or not 1 <= max_cases <= 40:
-        raise ValueError("max cases must be 1..40")
+    base_url = _validate_probe_configuration(url, model, max_cases, total_deadline, per_case_deadline)
     request_json = request_json or _http_json
     deadline = time.monotonic() + float(total_deadline)
+    metadata_started = time.monotonic()
 
     def get(path: str) -> dict[str, Any]:
         remaining = deadline - time.monotonic()
@@ -519,39 +543,88 @@ def run_native_probe(*, url: str, model: str, max_cases: int = 40,
     metadata = {"ollama_version": version, "model": model, "model_digest": digest,
                 "admission_status": NativeDecisionDiagnostic.admission_status,
                 "admission": "separate same-messages/tools/options request with num_predict=1; prompt_eval_count observed",
+                "cost_disclosure": "Each case sends a preflight request and a separate decision request; no warmup or retries.",
                 "context_tokens": MODEL_CONTEXT_TOKENS, "output_reserve": OUTPUT_TOKEN_RESERVE,
-                "request_digest": "SHA-256 of canonical original native request (num_predict=384)"}
+                "request_digest": "SHA-256 of canonical original native request (num_predict=384)",
+                "metadata_elapsed_ms": round((time.monotonic() - metadata_started) * 1000, 1)}
+    if on_metadata is not None:
+        on_metadata(metadata)
+
+    active_attempts: dict[str, dict[str, Any]] = {}
+    active_request_sha256: str | None = None
+
+    def record_attempt(name: str, operation: Callable[[], Any]) -> Any:
+        attempt = active_attempts[name]
+        attempt["attempts"] += 1
+        started = time.monotonic()
+        try:
+            result = operation()
+            attempt["success"] = True
+            return result
+        except Exception as exc:
+            attempt["success"] = False
+            attempt["failure_category"] = _safe_exception_category(exc)
+            raise
+        finally:
+            attempt["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
 
     def admission(body: dict[str, Any], timeout: float) -> NativeAdmissionProof:
+        nonlocal active_request_sha256
         preflight = copy.deepcopy(body)
         preflight["options"]["num_predict"] = 1
-        response = request_json(urllib.parse.urljoin(base_url, "api/chat"), preflight, timeout)
-        count = response.get("prompt_eval_count")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise InterpreterFailure("native_admission_prompt_count_missing")
         canonical = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        return NativeAdmissionProof(count, hashlib.sha256(canonical).hexdigest(),
-                                    MODEL_CONTEXT_TOKENS, model, "ollama_prompt_eval_count")
+        active_request_sha256 = hashlib.sha256(canonical).hexdigest()
+
+        def perform() -> NativeAdmissionProof:
+            response = request_json(urllib.parse.urljoin(base_url, "api/chat"), preflight, timeout)
+            count = response.get("prompt_eval_count")
+            if (isinstance(count, bool) or not isinstance(count, int) or count < 0
+                    or count + OUTPUT_TOKEN_RESERVE > MODEL_CONTEXT_TOKENS):
+                raise InterpreterFailure("native_admission_prompt_count_missing")
+            return NativeAdmissionProof(count, active_request_sha256 or "",
+                                        MODEL_CONTEXT_TOKENS, model, "ollama_prompt_eval_count")
+        return record_attempt("admission_preflight", perform)
 
     def transport(body: dict[str, Any], timeout: float) -> dict[str, Any]:
-        return request_json(urllib.parse.urljoin(base_url, "api/chat"), body, timeout)
+        return record_attempt("decision_transport", lambda: request_json(
+            urllib.parse.urljoin(base_url, "api/chat"), body, timeout))
 
     diagnostic = _RecordingNativeDiagnostic(model, transport, admission,
                                             timeout=float(per_case_deadline))
     selected = CASES + HELD_OUT_CASES if held_out else CASES
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("native probe total deadline exceeded before evaluation")
-    results = evaluate(diagnostic, max_cases=max_cases, total_deadline=min(remaining, _MAX_PROBE_SECONDS),
-                       per_case_deadline=float(per_case_deadline), cases=selected)
-    for index, result in enumerate(results):
-        proof = diagnostic.admission_records[index] if index < len(diagnostic.admission_records) else None
+    results: list[dict[str, Any]] = []
+    for case in selected[:max_cases]:
+        remaining = max(deadline - time.monotonic(), 1e-9)
+        active_attempts = {
+            name: {"attempts": 0, "success": None, "failure_category": None, "elapsed_ms": 0.0}
+            for name in ("admission_preflight", "decision_transport")
+        }
+        active_request_sha256 = None
+        diagnostic.stop_condition = None
+        admission_count_before = len(diagnostic.admission_records)
+        case_results = evaluate(diagnostic, max_cases=1, total_deadline=min(remaining, _MAX_PROBE_SECONDS),
+                                per_case_deadline=float(per_case_deadline), cases=(case,))
+        if not case_results:
+            break
+        result = case_results[0]
+        results.append(result)
+        proof = (diagnostic.admission_records[admission_count_before]
+                 if len(diagnostic.admission_records) > admission_count_before else None)
         result["admission"] = (None if proof is None else {
             "status": NativeDecisionDiagnostic.admission_status,
             "prompt_tokens": proof.prompt_tokens, "context_tokens": proof.context_tokens,
             "output_reserve": OUTPUT_TOKEN_RESERVE, "request_sha256": proof.request_sha256,
             "source": proof.source,
         })
+        report_result = dict(result)
+        report_result["request_sha256"] = active_request_sha256
+        report_result["request_timing"] = copy.deepcopy(active_attempts)
+        report_result["stop_condition"] = diagnostic.stop_condition
+        if on_case is not None:
+            on_case(report_result)
+        if (diagnostic.stop_condition == "interpreter_unavailable"
+                or result.get("failure_category") == "total_deadline"):
+            break
     return metadata, results
 
 
@@ -565,22 +638,53 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--total-deadline", type=float, default=_MAX_PROBE_SECONDS)
     parser.add_argument("--per-case-deadline", type=float, default=_MAX_CASE_SECONDS)
     parser.add_argument("--held-out", action="store_true")
+    parser.add_argument("--report", help="optional new JSONL report; existing files are never overwritten")
     args = parser.parse_args(argv)
+    try:
+        _validate_probe_configuration(args.url, args.model, args.max_cases,
+                                      args.total_deadline, args.per_case_deadline)
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")))
+        return 2
+    report = None
+    if args.report:
+        try:
+            # Match conversation_eval's exclusive-create behavior; this happens before network I/O.
+            report = open(args.report, "x", encoding="utf-8", newline="\n")
+        except OSError:
+            print(json.dumps({"error": "report_unavailable"}, separators=(",", ":")))
+            return 2
+
+    def write_report(record: dict[str, Any]) -> None:
+        if report is not None:
+            report.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            report.flush()
+
     try:
         metadata, results = run_native_probe(url=args.url, model=args.model,
                                              max_cases=args.max_cases,
                                              total_deadline=args.total_deadline,
                                              per_case_deadline=args.per_case_deadline,
-                                             held_out=args.held_out)
+                                             held_out=args.held_out,
+                                             on_metadata=lambda value: write_report({"metadata": value}),
+                                             on_case=write_report)
     except Exception as exc:
-        print(json.dumps({"error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")))
+        write_report({"summary": True, "failure_category": _safe_exception_category(exc),
+                      "promotion": False})
+        if report is not None:
+            report.close()
+        print(json.dumps({"error": _safe_exception_category(exc)}, separators=(",", ":")))
         return 2
     print(json.dumps({"metadata": metadata}, ensure_ascii=False, separators=(",", ":")))
     for result in results:
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     passed = sum(bool(result["passed"]) for result in results)
-    print(json.dumps({"summary": True, "passed": passed, "failed": len(results) - passed,
-                      "total": len(results), "promotion": False}, separators=(",", ":")))
+    summary = {"summary": True, "passed": passed, "failed": len(results) - passed,
+               "total": len(results), "promotion": False}
+    print(json.dumps(summary, separators=(",", ":")))
+    write_report(summary)
+    if report is not None:
+        report.close()
     return 0 if passed == len(results) else 1
 
 

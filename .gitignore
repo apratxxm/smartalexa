@@ -58,3 +58,6 @@ node_modules/
 /*.docx
 /*.psd
 /linkedin banner.png
+
+# Wake training scratch output
+/assistant/wakebench/train/_work/

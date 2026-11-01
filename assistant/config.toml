@@ -15,10 +15,36 @@ radio_length     = 49
 catalogue_auto_refresh = false
 
 [runtime]
+runtime = "legacy"
 # Prevent automatic system sleep while Memoir listens on confirmed AC power.
 # Battery and unknown power states never hold a request. Manual sleep still wins;
 # display sleep remains allowed. Disable to opt out completely.
 keep_awake_on_ac = true
+
+[core]
+# Phase 4 public-knowledge answers: one Wikipedia lookup plus one bounded synthesis call.
+knowledge = false
+
+[core.brain]
+# Free hosted endpoint only. Keep credentials in the environment named here.
+base_url = "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1"
+model = "@cf/qwen/qwen3-30b-a3b-fp8"
+api_key_env = "CF_API_TOKEN"
+turn_deadline_seconds = 18
+
+[core.brain.alt]
+# Explicit --provider alt only; never an automatic failover.
+base_url = "https://api.groq.com/openai/v1"
+model = "openai/gpt-oss-20b"
+api_key_env = "GROQ_API_KEY"
+
+[core.capture]
+max_seconds = 8
+
+[core.codex]
+# Scratch folder for the phase 3 Codex trials (lead 28 Oct; sandbox ceiling and deadline
+# guards are in place). Point it at a real project when you choose one. Phase 3 stays off.
+project_dir = 'A:\pisha\codex-scratch'
 
 [audio]
 # NEVER "default": Windows can silently route input from the Bluetooth speaker's
@@ -72,7 +98,7 @@ ring_buffer_seconds = 30      # for miss-logging and wake-word pre-roll
 # A list runs every model at once and triggers on whichever scores highest.
 # Single-model hit rate was only ~2 in 5; the models miss different utterances,
 # so two together cover noticeably more. Say either phrase.
-model           = ["alexa", "hey_mycroft"]
+model           = ["alexa"]
 # Real 0-1 confidence, so the tiers are native rather than emulated.
 # In STT-listener mode only the high tier ducks early. A stronger score at or
 # above acoustic_activation_threshold can start the spoken acknowledgement
@@ -90,19 +116,16 @@ cooldown_seconds = 2.0
 # recording vs 21% and 8/19 for stock, but ~36 false activations/hour on
 # generic speech at 0.5 x2 -- so it only proposes a wake: small.en must hear
 # "Alexa" in the last 1.6 s before anything happens.
-personal_model     = "assistant/models/wake/alexa_user.onnx"
-personal_threshold = 0.5
-personal_patience  = 2      # consecutive 80 ms chunks at or above threshold
 
 [listener]
 # A fast trigger-specific recognizer remains a fallback for acoustic misses;
 # strong acoustic Alexa detections can also start the follow-up capture.
 mode            = "stt"
 # Opt in to the single-owner asynchronous capture path.
-async_enabled   = false
+async_enabled   = true
 # Keep acoustic and text trigger vocabularies aligned. Common words such as
 # "computer" made ordinary dictation look like a command.
-phrases         = ["alexa", "hey mycroft"]
+phrases         = ["alexa"]
 allow_fuzzy     = false
 fuzzy_cutoff    = 0.72
 # 300 discarded quiet/far "Alexa"s before transcription (00:00, 9 in 30 s).
@@ -188,7 +211,8 @@ timeout_seconds = 3.0
 [conversation]
 # Incremental central interpreter integration. Keep disabled until the
 # real-model routing gate is accepted.
-enabled = false
+enabled = true
+interpreter = "standard"
 timeout_seconds = 3.0
 
 [stt]

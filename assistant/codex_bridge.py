@@ -33,6 +33,26 @@ class CodexError(RuntimeError):
         self.retry_at = retry_at
 
 
+class DeadlineExpired(CodexError):
+    """The deadline expired before dispatch."""
+
+
+def _remaining(guard, limit=None):
+    if guard is None:
+        return limit
+    try:
+        remaining = guard()
+    except Exception as exc:
+        raise DeadlineExpired("Codex deadline expired") from exc
+    if not isinstance(remaining, (int, float)) or not math.isfinite(remaining) or remaining <= 0:
+        raise DeadlineExpired("Codex deadline expired")
+    return min(remaining, limit) if limit is not None else remaining
+
+
+def _guard_args(guard):
+    return {"guard": guard} if guard is not None else {}
+
+
 class DeliveryUnknown(CodexError):
     """A CLI queue operation timed out after its delivery was indeterminate."""
 
@@ -86,7 +106,7 @@ def _parse_codex_version(output: str) -> tuple | None:
     return major, minor, patch, int(prerelease is None), tuple(prerelease_key)
 
 
-def _resolve_codex_executable(*, platform=None, local_app_data=None, which=None, run=None, clock=None) -> str | None:
+def _resolve_codex_executable(*, platform=None, local_app_data=None, which=None, run=None, clock=None, guard=None) -> str | None:
     """Lazy, read-only selection among bounded known installed binaries.
 
     PATH can point at the older standalone CLI. It cannot introduce a random
@@ -142,7 +162,7 @@ def _resolve_codex_executable(*, platform=None, local_app_data=None, which=None,
     # Prefer probing current desktop installs within the total bounded budget.
     ordered = sorted(candidates.items(), key=lambda row: row[1], reverse=True)[:8]
     for executable, preference in ordered:
-        remaining = _VERSION_BUDGET - (clock() - started)
+        remaining = _remaining(guard, _VERSION_BUDGET - (clock() - started))
         if remaining <= 0:
             break
         try:
@@ -266,13 +286,14 @@ class CodexBridge:
     def _fail(self, message: str) -> CodexError:
         return CodexError(message)
 
-    def _spawn(self) -> None:
+    def _spawn(self, *, guard=None) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
         if not self.executable:
-            self.executable = _resolve_codex_executable()
+            self.executable = _resolve_codex_executable(**_guard_args(guard))
         if not self.executable:
             raise CodexError("A verified installed Codex executable was not found", code="transport")
+        _remaining(guard)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             proc = subprocess.Popen(
@@ -627,7 +648,7 @@ class CodexBridge:
             return False
         return True
 
-    def _send(self, message: dict[str, Any], *, proc=None) -> None:
+    def _send(self, message: dict[str, Any], *, proc=None, guard=None) -> None:
         # Server-request replies stay bound to the process that asked, even if
         # retirement races the write. They can never answer a newer server ID.
         proc = self._proc if proc is None else proc
@@ -635,9 +656,15 @@ class CodexBridge:
             raise CodexError("Codex app-server connection is closed")
         try:
             raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
-            with self._write_lock:
+            acquired = self._write_lock.acquire(timeout=_remaining(guard)) if guard is not None else self._write_lock.acquire()
+            if not acquired:
+                raise DeadlineExpired("Codex write lock deadline expired")
+            try:
+                _remaining(guard)
                 proc.stdin.write(raw)
                 proc.stdin.flush()
+            finally:
+                self._write_lock.release()
         except (OSError, BrokenPipeError, ValueError) as exc:
             self._connection_failed(CodexError(f"Codex app-server write failed: {exc}", code="transport"), proc=proc)
             raise CodexError("Codex app-server write failed") from exc
@@ -649,12 +676,13 @@ class CodexBridge:
         *,
         timeout: float | None = None,
         mutation: bool = False,
+        guard=None,
     ) -> dict[str, Any]:
         if mutation:
             with self._state_lock:
                 self._mutation_pending += 1
         try:
-            return self._request_once(method, params, timeout=timeout, mutation=mutation)
+            return self._request_once(method, params, timeout=timeout, mutation=mutation, **_guard_args(guard))
         finally:
             if mutation:
                 with self._state_lock:
@@ -667,6 +695,7 @@ class CodexBridge:
         *,
         timeout: float | None = None,
         mutation: bool = False,
+        guard=None,
     ) -> dict[str, Any]:
         with self._state_lock:
             if self._closed:
@@ -679,15 +708,21 @@ class CodexBridge:
             pending = _Pending()
             self._pending[ident] = pending
         try:
-            self._send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+            self._send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params}, **_guard_args(guard))
         except Exception as exc:
             with self._pending_lock:
                 self._pending.pop(ident, None)
+            if isinstance(exc, DeadlineExpired):
+                raise
             if mutation:
                 self._mark_mutation_uncertain()
                 raise DeliveryUnknown(f"Delivery of {method} is unknown") from exc
             raise
         wait_for = self.timeout if timeout is None else timeout
+        try:
+            wait_for = _remaining(guard, wait_for)
+        except DeadlineExpired:
+            wait_for = 0
         if not pending.event.wait(wait_for):
             with self._pending_lock:
                 self._pending.pop(ident, None)
@@ -719,30 +754,33 @@ class CodexBridge:
             self._mutation_uncertain = True
             self._ready = False
 
-    def _guard_mutation(self) -> None:
+    def _guard_mutation(self, *, guard=None) -> None:
         with self._state_lock:
             if self._mutation_uncertain:
                 raise DeliveryUnknown("A previous mutation has unknown delivery; create a new bridge")
             blocked = self._quota_blocked
         if blocked:
-            self._recheck_quota()
+            self._recheck_quota(**_guard_args(guard))
         with self._state_lock:
             if self._mutation_uncertain:
                 raise DeliveryUnknown("A previous mutation has unknown delivery; create a new bridge")
             if self._quota_blocked:
                 raise CodexError("Codex quota reset has not been verified; this bridge remains blocked", code="quota")
 
-    def _recheck_quota(self) -> None:
+    def _recheck_quota(self, *, guard=None) -> None:
         """A later explicit mutation may verify allowance, never retry a prompt."""
-        with self._quota_check_lock:
+        acquired = self._quota_check_lock.acquire(timeout=_remaining(guard)) if guard is not None else self._quota_check_lock.acquire()
+        if not acquired:
+            raise DeadlineExpired("Codex quota lock deadline expired")
+        try:
             with self._state_lock:
                 if (not self._quota_blocked or self._closed or self._mutation_uncertain
                         or time.monotonic() < self._quota_recheck_at):
                     return
                 self._quota_recheck_at = time.monotonic() + _QUOTA_RECHECK_COOLDOWN
             try:
-                self._check_account()
-                result = self._request("account/rateLimits/read", {})
+                self._check_account(**_guard_args(guard))
+                result = self._request("account/rateLimits/read", {}, **_guard_args(guard))
             except CodexError:
                 # Unsupported endpoints and unknown/auth failures are not zero
                 # usage. No credit reset, purchase, or mutation is attempted.
@@ -752,8 +790,11 @@ class CodexBridge:
                     if not self._mutation_uncertain and not self._closed:
                         self._quota_blocked = False
 
-    def _check_account(self) -> None:
-        result = self._request("account/read", {"refreshToken": False})
+        finally:
+            self._quota_check_lock.release()
+
+    def _check_account(self, *, guard=None) -> None:
+        result = self._request("account/read", {"refreshToken": False}, **_guard_args(guard))
         account = result.get("account") if isinstance(result.get("account"), dict) else result
         if account.get("type") != "chatgpt":
             raise CodexError("Codex account is not a signed-in ChatGPT account", code="auth")
@@ -779,14 +820,14 @@ class CodexBridge:
             )
         return False
 
-    def _choose_model(self) -> str:
+    def _choose_model(self, *, guard=None) -> str:
         entries: list[dict[str, Any]] = []
         cursor: Any = None
         while True:
             params: dict[str, Any] = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
-            result = self._request("model/list", params)
+            result = self._request("model/list", params, **_guard_args(guard))
             entries.extend(self._model_entries(result))
             cursor = result.get("nextCursor") or result.get("next_cursor")
             if not cursor:
@@ -883,8 +924,11 @@ class CodexBridge:
             if self._last_created and self._last_created["id"] == thread_id:
                 self._record_receipt({**self._last_created, **updates})
 
-    def ensure_ready(self) -> str:
-        with self._startup_lock:
+    def ensure_ready(self, *, guard=None) -> str:
+        acquired = self._startup_lock.acquire(timeout=_remaining(guard)) if guard is not None else self._startup_lock.acquire()
+        if not acquired:
+            raise DeadlineExpired("Codex startup lock deadline expired")
+        try:
             with self._state_lock:
                 if self._closed:
                     raise CodexError("CodexBridge is closed")
@@ -908,17 +952,18 @@ class CodexBridge:
                     self._fatal = None
                     self._readiness_error = None
             try:
-                self._spawn()
+                self._spawn(**_guard_args(guard))
                 self._request(
                     "initialize",
                     {
                         "clientInfo": {"name": "memoir", "version": "0.1.0"},
                         "capabilities": {},
                     },
+                    **_guard_args(guard),
                 )
-                self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-                self._check_account()
-                selected = self._choose_model()
+                self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}}, **_guard_args(guard))
+                self._check_account(**_guard_args(guard))
+                selected = self._choose_model(**_guard_args(guard))
                 with self._state_lock:
                     if self._fatal is not None:
                         raise self._fatal
@@ -933,6 +978,9 @@ class CodexBridge:
                     self._readiness_retry_at = time.monotonic() + _READINESS_RETRY_COOLDOWN
                 self._terminate_process()
                 raise
+
+        finally:
+            self._startup_lock.release()
 
     def list_threads(self) -> list[dict[str, Any]]:
         self.ensure_ready()
@@ -963,24 +1011,25 @@ class CodexBridge:
                 break
         return values
 
-    def create_thread(self, title: str = "Memoir voice task", *, model: str | None = None) -> dict[str, Any]:
+    def create_thread(self, title: str = "Memoir voice task", *, model: str | None = None, sandbox: str = "workspace-write", guard=None) -> dict[str, Any]:
         if not isinstance(title, str) or not title:
             raise ValueError("title must be a non-empty string")
-        self.ensure_ready()
+        self.ensure_ready(**_guard_args(guard))
         chosen_model = self._validated_model(model)
-        self._guard_mutation()
-        self._check_account()
+        self._guard_mutation(**_guard_args(guard))
+        self._check_account(**_guard_args(guard))
         result = self._request(
             "thread/start",
             {
                 "cwd": str(self.project_root),
                 "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
+                "sandbox": sandbox,
                 "model": chosen_model,
                 "modelProvider": "openai",
                 "reasoningEffort": self._model_effort,
             },
             mutation=True,
+            **_guard_args(guard),
         )
         thread = result.get("thread") if isinstance(result.get("thread"), dict) else result
         ident = thread.get("id") if isinstance(thread, dict) else None
@@ -1004,6 +1053,7 @@ class CodexBridge:
                 "thread/name/set",
                 {"threadId": ident, "name": title},
                 mutation=True,
+                **_guard_args(guard),
             )
         except Exception as exc:
             if not isinstance(exc, CodexError):
@@ -1018,13 +1068,13 @@ class CodexBridge:
             output["warning"] = (output.get("warning", "") + " The created identity could not be saved for restart recovery.").strip()
         return output
 
-    def start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
+    def start_turn(self, thread_id: str, prompt: str, *, guard=None) -> dict[str, Any]:
         self._validate_id(thread_id)
         if not isinstance(prompt, str) or not 1 <= len(prompt) <= 12000:
             raise ValueError("prompt must contain 1..12000 characters")
-        self.ensure_ready()
-        self._guard_mutation()
-        self._check_account()
+        self.ensure_ready(**_guard_args(guard))
+        self._guard_mutation(**_guard_args(guard))
+        self._check_account(**_guard_args(guard))
         with self._state_lock:
             if thread_id not in self.owned_threads:
                 raise CodexError("start_turn is restricted to bridge-owned threads")
@@ -1046,6 +1096,7 @@ class CodexBridge:
                     "effort": self._model_effort,
                 },
                 mutation=True,
+                **_guard_args(guard),
             )
         except DeliveryUnknown:
             self._update_receipt(thread_id, status="submission_unknown")

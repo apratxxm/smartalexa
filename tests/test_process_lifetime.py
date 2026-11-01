@@ -42,6 +42,7 @@ class FakeKernel:
 @pytest.fixture(autouse=True)
 def isolated_job_cache(monkeypatch):
     monkeypatch.setattr(lifetime, "_job_handle", None)
+    monkeypatch.setenv(lifetime.MANAGED_PROCESS_TREE_ENV, "")
     monkeypatch.delenv(lifetime.MANAGED_PROCESS_TREE_ENV, raising=False)
 
 

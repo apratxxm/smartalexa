@@ -265,8 +265,21 @@ def _words_heard(text: str, transcript: str) -> bool:
                for start in range(len(heard) - len(wanted) + 1))
 
 
+def _numeric_before_volume_suffix(text: str) -> Optional[int]:
+    """Return a complete numeric-before-volume suffix, never an embedded number."""
+    match = re.fullmatch(r"\s*(\d{1,3})(?:\s*%|\s+percent)?\s+volume[\s,;.!?:]*", text,
+                         flags=re.I)
+    return int(match.group(1)) if match is not None else None
+
+
+def _has_numeric_before_volume_suffix(transcript: str) -> bool:
+    return any(_numeric_before_volume_suffix(transcript[boundary.end():]) is not None
+               for boundary in re.finditer(r"\s+", transcript))
+
+
 def _playback_request(transcript: str) -> tuple[str, Optional[int], bool]:
     """Separate a grounded absolute volume clause from the playback words."""
+    requested = parse(transcript).volume_after_play
     clauses = re.split(r"\s+(?:and(?:\s+then)?|then)\s+", transcript, flags=re.I)
     if len(clauses) > 1:
         tail = parse(clauses[-1])
@@ -278,18 +291,39 @@ def _playback_request(transcript: str) -> tuple[str, Optional[int], bool]:
             valid = (len(clauses) == 2 and tail.action is Action.VOLUME
                      and tail.volume_mode == "absolute" and type(tail.value) is int
                      and 0 <= tail.value <= 100)
-            return clauses[0], tail.value if valid else None, not valid
-    requested = parse(transcript).volume_after_play
+            if valid:
+                return clauses[0], tail.value, False
+            numeric_suffix = _numeric_before_volume_suffix(clauses[-1])
+            if (len(clauses) != 2 or numeric_suffix is None or not 0 <= numeric_suffix <= 100
+                    or type(requested) is not int or requested != numeric_suffix):
+                return clauses[0], None, True
     if requested is not None:
         # The rule parser also supports "at full volume" and "volume 20%".
         # Find the same absolute suffix through the volume parser itself.
         for boundary in re.finditer(r"\s+", transcript):
-            tail = parse(transcript[boundary.end():])
+            tail_text = transcript[boundary.end():]
+            tail = parse(tail_text)
             if (tail.action is Action.VOLUME and tail.volume_mode == "absolute"
                     and tail.value == requested):
-                head = re.sub(r"\s+(?:at|on|with|and)$", "",
-                              transcript[:boundary.start()], flags=re.I)
+                numeric_suffix = None
+            else:
+                numeric_suffix = _numeric_before_volume_suffix(tail_text)
+                if numeric_suffix is None:
+                    continue
+                tail = parse(f"volume {numeric_suffix}")
+            if (tail.action is Action.VOLUME and tail.volume_mode == "absolute"
+                    and type(tail.value) is int and 0 <= tail.value <= 100
+                    and tail.value == requested):
+                head = transcript[:boundary.start()]
+                head = re.sub(r"[\s,;:]+(?:at|on|with|and|then)[\s,;:]*$", "", head,
+                              flags=re.I)
+                head = re.sub(r"[\s,;:]+$", "", head)
                 return head, requested, False
+            if numeric_suffix is not None:
+                return transcript, None, True
+    else:
+        if _has_numeric_before_volume_suffix(transcript):
+            return transcript, None, True
     return transcript, None, False
 
 
@@ -890,7 +924,8 @@ def decide(text: str, brain: Optional[Brain]) -> Intent:
     playback_text, play_volume, unsupported = _playback_request(text)
     if _multiple_actionable_sentences(text):
         return Intent(Action.UNKNOWN, source="none", matched_rule="ambiguous_compound")
-    if ruled.action in FAST_ACTIONS and _unsupported_compound(text):
+    if ((ruled.action in FAST_ACTIONS or _has_numeric_before_volume_suffix(text))
+            and _unsupported_compound(text)):
         return Intent(Action.UNKNOWN, source="none", matched_rule="unsupported_compound")
     if ruled.action in {Action.PLAY_TRACK, Action.PLAY_ARTIST, Action.PLAY_PLAYLIST, Action.PLAY_ALBUM}:
         if unsupported:

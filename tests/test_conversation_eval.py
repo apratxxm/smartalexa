@@ -222,6 +222,93 @@ def test_original_timeout_is_restored_after_interpreter_exception():
     assert decider.timeout == 30.0
 
 
+def test_interpreter_failure_diagnostics_preserve_only_bounded_fields():
+    from assistant.conversation_brain import InterpreterFailure
+
+    class FailingDecider(FakeDecider):
+        def __init__(self, error):
+            super().__init__([None])
+            self.error = error
+
+        def decide(self, transcript, context=None):
+            super().decide(transcript, context)
+            raise self.error
+
+    case = EvalCase("failure", "Pause.", ("plan",))
+    result = evaluate(FailingDecider(InterpreterFailure(
+        "invalid_decision", validation_error="missing_evidence_refs")), cases=(case,))[0]
+    assert result["failure_category"] == "interpreter_failure"
+    assert result["interpreter_error_code"] == "invalid_decision"
+    assert result["interpreter_validation_error"] == "missing_evidence_refs"
+
+    redacted_values = (
+        "x" * 121,
+        "bad\nreason",
+        "bad\x7freason",
+        123,
+    )
+    for validation_error in redacted_values:
+        result = evaluate(FailingDecider(InterpreterFailure(
+            "Invalid Code!", validation_error=validation_error)), cases=(case,))[0]
+        assert result["interpreter_error_code"] == "unclassified"
+        assert result["interpreter_validation_error"] == "contract_invalid"
+
+    result = evaluate(FailingDecider(InterpreterFailure(
+        "invalid_decision")), cases=(case,))[0]
+    assert result["interpreter_validation_error"] is None
+
+
+def test_interpreter_failure_diagnostics_survive_deadline_category_override():
+    from assistant.conversation_brain import InterpreterFailure
+
+    now = [0.0]
+
+    class LateFailure(FakeDecider):
+        def decide(self, transcript, context=None):
+            super().decide(transcript, context)
+            now[0] += 3.1
+            raise InterpreterFailure("invalid_decision", validation_error="bad_shape")
+
+    decider = LateFailure([None])
+    result = evaluate(decider, cases=(EvalCase("late_failure", "Pause.", ("plan",)),),
+                      clock=lambda: now[0])[0]
+    assert result["failure_category"] == "deadline_exceeded"
+    assert result["interpreter_error_code"] == "invalid_decision"
+    assert result["interpreter_validation_error"] == "bad_shape"
+
+
+def test_interpreter_unavailable_reports_type_without_exception_text_and_stops():
+    from assistant.conversation_brain import InterpreterUnavailable
+
+    class UnavailableDecider(FakeDecider):
+        def decide(self, transcript, context=None):
+            super().decide(transcript, context)
+            raise InterpreterUnavailable("private transport detail")
+
+    cases = (EvalCase("unavailable", "Pause.", ("plan",)),
+             EvalCase("not_reached", "Resume.", ("plan",)))
+    decider = UnavailableDecider([None, None])
+    results = evaluate(decider, cases=cases)
+    assert len(results) == 1
+    assert results[0]["failure_category"] == "interpreter_unavailable"
+    assert results[0]["interpreter_error_code"] == "interpreter_unavailable"
+    assert "private transport detail" not in str(results[0])
+    assert len(decider.calls) == 1
+
+
+def test_successful_evaluation_result_shape_is_unchanged():
+    decider = FakeDecider([Decision("answer", text="Inertia resists change in motion.")])
+    result = evaluate(decider, cases=(EvalCase("success", "Define inertia.", ("answer",)),))[0]
+    assert result == {
+        "case_id": "success",
+        "passed": True,
+        "failure_category": None,
+        "kind": "answer",
+        "capabilities": [],
+        "latency_ms": 0.0,
+    }
+
+
 def test_cli_held_out_flag_appends_cases_without_changing_default(monkeypatch, capsys):
     import assistant.conversation_brain as conversation_brain
     import assistant.experimental.conversation_eval as conversation_eval

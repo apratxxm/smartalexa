@@ -1,6 +1,7 @@
 """Telemetry degradation tests: observability must never break commands."""
 import numpy as np
 import time
+from unittest.mock import Mock
 
 from assistant.config import Config
 from assistant.telemetry import Event, Telemetry
@@ -23,6 +24,8 @@ def make_telemetry(tmp_path):
 def test_jsonl_enospc_is_best_effort(tmp_path, monkeypatch):
     telemetry = make_telemetry(tmp_path)
     real_open = open
+    info = Mock()
+    monkeypatch.setattr("assistant.telemetry.log.info", info)
 
     def fail_open(path, *args, **kwargs):
         if str(path).endswith("telemetry.jsonl"):
@@ -30,7 +33,41 @@ def test_jsonl_enospc_is_best_effort(tmp_path, monkeypatch):
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", fail_open)
-    telemetry.write(Event(outcome="ok"))
+    event = telemetry.record_near_miss(np.ones(1600, np.int16), "", "candidate", now=1)
+    assert event.audio_status == "saved" and event.audio_path
+    assert event.jsonl_status == "failed"
+    assert (telemetry.jsonl_path.parent.parent.parent / event.audio_path).exists()
+    summary = info.call_args.args[1]
+    assert event.event_id in summary and "audio_status=saved" in summary
+    assert "index=failed" in summary
+    outcomes = telemetry.diagnostic_outcome_snapshot()
+    assert outcomes["jsonl_write_failure"] == 1
+    assert outcomes["near_miss_audio_saved"] == 1
+    assert outcomes["near_miss_saved_unindexed"] == 1
+    assert outcomes["jsonl_write_success"] == 0
+    assert event.event_id not in str(outcomes)
+
+
+def test_jsonl_write_reports_success_and_failure(tmp_path, monkeypatch):
+    telemetry = make_telemetry(tmp_path)
+    saved = Event(outcome="ok")
+    assert telemetry.write(saved) is True
+    assert saved.jsonl_status == "indexed"
+
+    real_open = open
+
+    def fail_jsonl(path, *args, **kwargs):
+        if str(path).endswith("telemetry.jsonl"):
+            raise OSError(28, "No space left on device")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_jsonl)
+    failed = Event(outcome="ok")
+    assert telemetry.write(failed) is False
+    assert failed.jsonl_status == "failed"
+    outcomes = telemetry.diagnostic_outcome_snapshot()
+    assert outcomes["jsonl_write_success"] == 1
+    assert outcomes["jsonl_write_failure"] == 1
 
 
 def test_audio_enospc_returns_empty_and_removes_partial_file(tmp_path, monkeypatch):
@@ -93,20 +130,32 @@ def test_pruning_only_removes_generated_archive_files(tmp_path):
     assert not generated.exists()
 
 
-def test_candidate_rate_limit_suppresses_audio_but_keeps_every_decision(tmp_path):
+def test_candidate_rate_limit_suppresses_audio_but_keeps_every_decision(tmp_path, monkeypatch):
     import json
     telemetry = make_telemetry(tmp_path)
+    info = Mock()
+    monkeypatch.setattr("assistant.telemetry.log.info", info)
     audio = np.ones(1600, np.int16)
     first = telemetry.record_near_miss(audio, "you", "speech_no_trigger", now=100, kind="no_trigger", segment_id="first")
     second = telemetry.record_near_miss(audio, "", "speech_no_trigger", now=101, kind="no_trigger", segment_id="second")
     rows = [json.loads(line) for line in telemetry.jsonl_path.read_text().splitlines()]
     assert len(rows) == 2
     assert first.audio_status == "saved" and first.audio_path
+    assert first.jsonl_status == "indexed"
     assert second.audio_status == "suppressed" and second.audio_reason == "rate_limited"
+    assert second.jsonl_status == "indexed"
     assert second.audio_path == "" and second.segment_id == "second"
     assert all(row["review_state"] == "unknown" for row in rows)
     assert first.capture_session_id == second.capture_session_id
     assert len(list(telemetry.audio_dir.rglob("*.wav"))) == 1
+    outcomes = telemetry.diagnostic_outcome_snapshot()
+    assert outcomes["near_miss_audio_saved"] == 1
+    assert outcomes["near_miss_audio_rate_limited"] == 1
+    assert outcomes["jsonl_write_success"] == 2
+    assert outcomes["jsonl_write_failure"] == 0
+    summary = info.call_args.args[1]
+    assert second.event_id in summary and "audio_reason=rate_limited" in summary
+    assert "index=indexed" in summary
 
 
 def test_candidate_raw_and_processed_are_frame_paired_and_hashed(tmp_path):
@@ -146,6 +195,20 @@ def test_candidate_pair_budget_never_prunes_its_just_saved_raw_clip(tmp_path):
     assert event.audio_status == "suppressed" and event.audio_reason == "archive_cap"
     assert not event.audio_path and not event.processed_audio_path
     assert not list(telemetry.audio_dir.rglob("*.wav"))
+    outcomes = telemetry.diagnostic_outcome_snapshot()
+    assert outcomes["near_miss_audio_cap_suppressed"] == 1
+    assert outcomes["jsonl_write_success"] == 1
+
+
+def test_diagnostic_outcome_snapshot_is_fixed_and_detached(tmp_path):
+    telemetry = make_telemetry(tmp_path)
+    first = telemetry.diagnostic_outcome_snapshot()
+    first["jsonl_write_failure"] = 100
+    second = telemetry.diagnostic_outcome_snapshot()
+    assert second["jsonl_write_failure"] == 0
+    assert len(second) == 11
+    assert all(isinstance(value, int) for value in second.values())
+    assert "event_id" not in second and all("event" not in key for key in second)
 
 
 def test_candidate_disabled_disk_and_alignment_failures_remain_visible(tmp_path, monkeypatch):
@@ -161,6 +224,11 @@ def test_candidate_disabled_disk_and_alignment_failures_remain_visible(tmp_path,
     event = telemetry.record_near_miss(audio, "", "candidate", now=20, relative_end_sample=12)
     assert event.audio_status == "unavailable" and event.audio_reason == "invalid_relative_bounds"
     assert len(telemetry.jsonl_path.read_text().splitlines()) == 3
+    outcomes = telemetry.diagnostic_outcome_snapshot()
+    assert outcomes["near_miss_audio_disabled"] == 1
+    assert outcomes["near_miss_audio_failed"] == 1
+    assert outcomes["near_miss_audio_unavailable"] == 1
+    assert outcomes["jsonl_write_success"] == 3
 
 
 def test_processed_mismatch_does_not_fabricate_aligned_audio(tmp_path):
@@ -321,6 +389,193 @@ def _use_review_store(tmp_path, monkeypatch, rows):
                      encoding="utf-8")
     monkeypatch.setattr("assistant.telemetry._REVIEW_STORE_PATH", store)
     return store
+
+
+def _report_coverage(samples, **overrides):
+    coverage = {
+        "version": 1, "sample_rate": 16000, "clock": "perf_counter",
+        "window_start": 1.0, "window_end": 2.0, "diagnostic_generation": 3,
+        "read_start": 10, "read_end_exclusive": 11, "retained_samples": samples,
+        "estimated_source_start": 1.1, "estimated_source_end": 2.1,
+        "read_completed_start": 2.2, "read_completed_end": 2.3,
+        "pairing": "read_invocation", "sample_alignment": "unverified",
+        "capture_continuity": "unverified", "padding_possible": True,
+        "status": "available", "break_reasons": [],
+    }
+    coverage.update(overrides)
+    return coverage
+
+
+def _saved_parent(telemetry, *, event_id="aaaaaaaaaaaa"):
+    parent = Event(event_id=event_id, ts=1, trigger_source="miss")
+    parent.audio_path = telemetry.save_audio(parent, np.zeros(16000, dtype=np.int16))
+    assert parent.audio_path
+    assert parent.audio_status == "saved"
+    assert telemetry.write(parent)
+    return parent
+
+
+def test_report_diagnostic_archives_paired_child_and_stays_out_of_review_queues(tmp_path):
+    from assistant.experimental.wake_train import review_server
+    import json
+
+    telemetry = make_telemetry(tmp_path)
+    parent = _saved_parent(telemetry)
+    raw = np.arange(1600, dtype=np.int16)
+    clean = raw.copy()
+    event = telemetry.record_report_diagnostic(
+        parent, raw, clean, coverage=_report_coverage(raw.size), parent_indexed=True)
+
+    assert event.trigger_source == "miss_diagnostic" and event.overlap_of == parent.event_id
+    assert event.review_state == "unknown" and event.diagnostic_only is True
+    assert event.audio_status == "saved" and event.processed_audio_status == "saved"
+    assert event.processed_alignment == "unverified"
+    assert event.diagnostic_metadata["saved_samples"] == raw.size
+    assert event.diagnostic_metadata["crop_start_sample"] == 0
+    assert event.diagnostic_metadata["crop_end_sample_exclusive"] == raw.size
+    rows = [json.loads(line) for line in telemetry.jsonl_path.read_text().splitlines()]
+    row = rows[-1]
+    assert row["trigger_source"] == "miss_diagnostic" and row["review_state"] == "unknown"
+    category, _ = review_server.source_classification(row)
+    assert category == "all"
+    assert not review_server._matches_mode(row, category, "reported_misses")
+    assert len(list(telemetry.audio_dir.glob("*.wav"))) == 3
+
+
+def test_report_diagnostic_cap_suppression_preserves_parent_and_pinned_older_clip(tmp_path, monkeypatch):
+    telemetry = make_telemetry(tmp_path)
+    parent = _saved_parent(telemetry, event_id="bbbbbbbbbbbb")
+    pinned = telemetry.audio_dir / "20200101-000000_deadbeef.wav"
+    pinned.write_bytes(b"p" * 40000)
+    import os
+    os.utime(pinned, (1, 1))
+    _use_review_store(tmp_path, monkeypatch, [_review_row(pinned)])
+    telemetry.max_audio_mb = 0.07
+
+    event = telemetry.record_report_diagnostic(
+        parent, np.zeros(6000, np.int16), np.ones(6000, np.int16),
+        coverage=_report_coverage(6000), parent_indexed=True)
+    parent_path = telemetry.jsonl_path.parent.parent.parent / parent.audio_path
+    assert event.audio_status == "suppressed" and event.audio_reason == "archive_cap"
+    assert parent_path.exists() and pinned.exists()
+    assert event.audio_path == "" and event.processed_audio_path == ""
+    assert telemetry._archive_protected_paths == set()
+
+
+def test_report_diagnostic_protects_written_raw_during_nested_clean_prune_and_cleans_scope(
+        tmp_path, monkeypatch):
+    telemetry = make_telemetry(tmp_path)
+    parent = _saved_parent(telemetry)
+    calls = []
+    original_prune = telemetry._prune_audio
+
+    def inspect_prune(required_bytes=0, subdir="", protected_paths=None):
+        calls.append(set(telemetry._archive_protected_paths))
+        return original_prune(required_bytes, subdir, protected_paths)
+
+    monkeypatch.setattr(telemetry, "_prune_audio", inspect_prune)
+    event = telemetry.record_report_diagnostic(
+        parent, np.zeros(1600, np.int16), np.ones(1600, np.int16),
+        coverage=_report_coverage(1600), parent_indexed=True)
+    parent_path = (telemetry.jsonl_path.parent.parent.parent / parent.audio_path).resolve()
+    raw_path = (telemetry.jsonl_path.parent.parent.parent / event.audio_path).resolve()
+    assert len(calls) >= 3  # reservation, nested raw save, nested clean save
+    assert parent_path in calls[0] and parent_path in calls[1] and parent_path in calls[2]
+    assert raw_path in calls[2]
+    assert telemetry._archive_protected_paths == set()
+
+
+def test_report_diagnostic_rejects_bad_coverage_pair_and_oversize_without_wav(tmp_path):
+    telemetry = make_telemetry(tmp_path)
+    parent = _saved_parent(telemetry)
+    cases = [
+        (np.zeros(1600, np.int16), np.zeros(1600, np.int16),
+         _report_coverage(1600, break_reasons=["invented"]), "invalid_coverage"),
+        (np.zeros(1600, np.int16), np.zeros(1601, np.int16),
+         _report_coverage(1600), "invalid_pair"),
+        (np.zeros(480001, np.int16), np.zeros(480001, np.int16),
+         _report_coverage(480001), "oversize_pair"),
+        (np.zeros(1600, np.float32), np.zeros(1600, np.float32),
+         _report_coverage(1600), "invalid_pair"),
+    ]
+    before = set(telemetry.audio_dir.glob("*.wav"))
+    for raw, clean, coverage, status in cases:
+        event = telemetry.record_report_diagnostic(parent, raw, clean, coverage=coverage,
+                                                   parent_indexed=True)
+        assert event.diagnostic_metadata["archive_status"] == status
+        assert not event.audio_path and not event.processed_audio_path
+    assert set(telemetry.audio_dir.glob("*.wav")) == before
+
+
+def test_report_diagnostic_requires_saved_and_indexed_parent(tmp_path):
+    telemetry = make_telemetry(tmp_path)
+    raw = np.zeros(1600, np.int16)
+    coverage = _report_coverage(raw.size)
+    for parent, indexed, expected in (
+            (Event(event_id="unsaved", audio_status="failed"), True, "parent_archive_unavailable"),
+            (_saved_parent(telemetry, event_id="cccccccccccc"), False, "parent_not_indexed")):
+        event = telemetry.record_report_diagnostic(parent, raw, raw.copy(), coverage=coverage,
+                                                   parent_indexed=indexed)
+        assert event.diagnostic_metadata["archive_status"] == expected
+        assert not event.audio_path and not event.processed_audio_path
+
+
+def test_report_diagnostic_retains_raw_when_clean_or_index_write_fails(tmp_path, monkeypatch):
+    telemetry = make_telemetry(tmp_path)
+    parent = _saved_parent(telemetry)
+    raw = np.zeros(1600, np.int16)
+    original_save = telemetry.save_audio
+
+    failed_once = {"done": False}
+
+    def raw_failure(event, pcm, subdir=""):
+        if not failed_once["done"]:
+            failed_once["done"] = True
+            event.audio_status, event.audio_reason = "failed", "audio_write_error"
+            return ""
+        return original_save(event, pcm, subdir)
+
+    monkeypatch.setattr(telemetry, "save_audio", raw_failure)
+    raw_failed = telemetry.record_report_diagnostic(
+        parent, raw, raw.copy(), coverage=_report_coverage(raw.size), parent_indexed=True)
+    assert raw_failed.audio_status == "failed"
+    assert raw_failed.processed_audio_status == "unavailable"
+    assert raw_failed.diagnostic_metadata["archive_status"] == "raw_failed"
+    assert not raw_failed.audio_path and not raw_failed.processed_audio_path
+
+    monkeypatch.setattr(telemetry, "save_audio", original_save)
+
+    def clean_failure(event, pcm, subdir=""):
+        if event.event_id.endswith("-processed"):
+            event.audio_status, event.audio_reason = "failed", "audio_write_error"
+            return ""
+        return original_save(event, pcm, subdir)
+
+    monkeypatch.setattr(telemetry, "save_audio", clean_failure)
+    partial = telemetry.record_report_diagnostic(
+        parent, raw, raw.copy(), coverage=_report_coverage(raw.size), parent_indexed=True)
+    assert partial.audio_status == "saved" and partial.processed_audio_status == "failed"
+    assert partial.diagnostic_metadata["archive_status"] == "raw_saved_clean_failed"
+    assert (telemetry.jsonl_path.parent.parent.parent / partial.audio_path).is_file()
+    assert not partial.processed_audio_path
+    assert telemetry._archive_protected_paths == set()
+
+    monkeypatch.setattr(telemetry, "save_audio", original_save)
+    real_open = open
+
+    def fail_index(path, *args, **kwargs):
+        if str(path).endswith("telemetry.jsonl"):
+            raise OSError(28, "No space left on device")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_index)
+    failed_index = telemetry.record_report_diagnostic(
+        parent, raw, raw.copy(), coverage=_report_coverage(raw.size), parent_indexed=True)
+    assert failed_index.jsonl_status == "failed"
+    assert failed_index.audio_status == "saved" and failed_index.processed_audio_status == "saved"
+    assert (telemetry.jsonl_path.parent.parent.parent / failed_index.audio_path).is_file()
+    assert (telemetry.jsonl_path.parent.parent.parent / failed_index.processed_audio_path).is_file()
+    assert telemetry._archive_protected_paths == set()
 
 
 def test_reviewed_near_miss_counts_toward_candidate_cap_and_is_pinned(tmp_path, monkeypatch):

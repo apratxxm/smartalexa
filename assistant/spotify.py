@@ -5,6 +5,7 @@ speaker. We only send transport commands.
 """
 from __future__ import annotations
 
+import unicodedata
 import argparse
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -170,7 +171,6 @@ class _RateLimitGuard:
         # Ban end-times already written to the log, so each ban is logged once.
         self._announced = {"player": 0.0, "web": 0.0}
         self._path = path
-        self._seen_mtime = None
         self._budget = budget or (_SHARED_REQUEST_BUDGET if clock is None and sleeper is None
                                   and window == 30.0 and total == 20 and background == 15
                                   else _RequestBudget(window, total, background, clock, sleeper))
@@ -181,13 +181,6 @@ class _RateLimitGuard:
         """Adopt a ban recorded by another process (e.g. the catalogue build)."""
         if self._path is None:
             return
-        try:
-            mtime = self._path.stat().st_mtime
-        except OSError:
-            return
-        if mtime == self._seen_mtime:
-            return
-        self._seen_mtime = mtime
         try:
             saved = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -337,7 +330,6 @@ class _RateLimitGuard:
                     self._path.name, os.getpid(), threading.get_ident()))
                 tmp.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
                 os.replace(tmp, self._path)
-                self._seen_mtime = self._path.stat().st_mtime
                 return True
             except OSError as exc:
                 log.debug("Could not save Spotify backoff: %s", exc)
@@ -380,7 +372,9 @@ class _RateLimitGuard:
             return attr
         scope = "player" if name in self.PLAYER else "web"
 
+        dispatch_state = {"sent": False}
         def guarded(*args, **kwargs):
+            dispatch_state["sent"] = False
             source, background = getattr(_request_context, "value", ("assistant", False))
             if source not in {"assistant", "catalogue", "manual_catalogue", "startup"}:
                 source = "assistant"
@@ -410,6 +404,7 @@ class _RateLimitGuard:
                 raise SpotifyRateLimited("Spotify {} API is rate-limiting this app; retrying in {:.0f} s".format(scope, remaining))
             started = time.monotonic()
             try:
+                dispatch_state["sent"] = True
                 result = attr(*args, **kwargs)
                 log.info("Spotify request method=%s source=%s mode=%s elapsed=%.3f status=success result=ok",
                          name, source, "background" if background else "foreground", time.monotonic() - started)
@@ -445,6 +440,7 @@ class _RateLimitGuard:
                          name, source, "background" if background else "foreground",
                          time.monotonic() - started, type(exc).__name__)
                 raise
+        guarded._dispatch_state = dispatch_state
         return guarded
 
 
@@ -487,6 +483,23 @@ def _catalogue_hit(query: str, index):
 
 class PlaybackVerificationError(RuntimeError):
     """Spotify accepted a request but did not report the intended state."""
+
+
+class PlaybackRateLimitUncertainty(PlaybackVerificationError, SpotifyRateLimited):
+    """A rate-limit error followed a possibly dispatched playback mutation."""
+
+
+class PlaybackDeferredUncertainty(PlaybackVerificationError, SpotifyRequestDeferred):
+    """Verification was deferred after playback might already have changed."""
+
+
+def _playback_uncertainty(error):
+    if isinstance(error, PlaybackVerificationError):
+        return error
+    cls = (PlaybackRateLimitUncertainty if isinstance(error, SpotifyRateLimited) else
+           PlaybackDeferredUncertainty if isinstance(error, SpotifyRequestDeferred) else
+           PlaybackVerificationError)
+    return cls("Playback may have been dispatched; no second mutation was attempted")
 
 
 class TrackLookupError(LookupError):
@@ -787,16 +800,59 @@ class Spotify:
 
     # ---------- transport ----------
 
-    def _verify(self, predicate, description: str) -> dict:
+    def _verify(self, predicate, description: str, *, horizon: Optional[float] = None) -> dict:
         """Bounded read-only checks; never repeat a playback mutation here."""
         target = self.device()
-        for attempt in range(4):
+        attempts = 4 if horizon is None or horizon > 0 else 1
+        spacing = 0.25 if horizon is None else max(0.0, float(horizon)) / (attempts - 1) if attempts > 1 else 0.0
+        for attempt in range(attempts):
             state = self.sp.current_playback()
             if state and (state.get("device") or {}).get("id") == target and predicate(state):
                 return state
-            if attempt < 3:
-                time.sleep(0.25)
+            if attempt < attempts - 1:
+                time.sleep(spacing)
         raise PlaybackVerificationError("Could not verify " + description + " on the selected laptop")
+
+    def _idle_uri_budget(self):
+        return float("inf")
+
+    def _open_idle_uri(self, uri):
+        open_external_target(uri)
+
+    @staticmethod
+    def _is_local_target(target, devices):
+        hostname = socket.gethostname().strip().casefold()
+        local = [device for device in devices if isinstance(device, dict)
+                 and str(device.get("name", "")).strip().casefold() == hostname
+                 and str(device.get("type", "")).casefold() == "computer"
+                 and not device.get("is_restricted")]
+        return bool(target and len(local) == 1 and local[0].get("id") == target)
+
+    def _start_idle_uri(self, uri, predicate, description):
+        self._idle_uri_budget()
+        self._open_idle_uri(uri)
+        try:
+            deadline = time.monotonic() + min(4.0, self._idle_uri_budget())
+            self._idle_uri_deadline = deadline
+            for attempt in range(4):
+                if time.monotonic() >= deadline:
+                    break
+                self._idle_uri_budget()
+                state = self.sp.current_playback()
+                self._idle_uri_budget()
+                now = time.monotonic()
+                if now <= deadline and state and (state.get("device") or {}).get("id") == self.device() and predicate(state):
+                    return
+                if attempt < 3 and now < deadline:
+                    time.sleep(min(4.0 / 3, deadline - now, self._idle_uri_budget()))
+            raise PlaybackVerificationError("Could not verify " + description + " on the selected laptop")
+        except Exception as exc:
+            uncertainty = _playback_uncertainty(exc)
+            if uncertainty is exc:
+                raise
+            raise uncertainty from exc
+        finally:
+            self._idle_uri_deadline = None
 
     def _local_enabled(self) -> bool:
         cfg = getattr(self, "_cfg", None)
@@ -934,7 +990,7 @@ class Spotify:
         # track may do the same. A substantial progress reset is observable.
         self._verify(lambda s: bool((s.get("item") or {}).get("uri")) and (
             (s.get("item") or {}).get("uri") != uri
-            or ((s.get("progress_ms") or 0) + 1000 < progress)
+            or (description != "next track" and ((s.get("progress_ms") or 0) + 1000 < progress))
         ), description)
 
     def is_playing(self) -> bool:
@@ -1440,13 +1496,20 @@ class Spotify:
             requested = title_key(requested_title, requested_title)
             exact_title = title_key(ranked[0].name, requested_title) == requested
             credits = (ranked[0].metadata or {}).get("artists") or [{"name": ranked[0].artist}]
-            exact_artist = bool(artist and any(_norm(row.get("name", "")) == _norm(artist)
+            # Spoken artists come without accents ("Beyonce"); Spotify keeps them ("Beyoncé").
+            fold = lambda value: "".join(ch for ch in unicodedata.normalize("NFKD", _norm(value))
+                                           if not unicodedata.combining(ch))
+            exact_artist = bool(artist and any(fold(row.get("name", "")) == fold(artist)
                                               for row in credits))
             competing_same_title = title_key(ranked[1].name, requested_title) == requested
             rival_credits = (ranked[1].metadata or {}).get("artists") or [{"name": ranked[1].artist}]
-            rival_exact_artist = bool(artist and any(_norm(row.get("name", "")) == _norm(artist)
+            rival_exact_artist = bool(artist and any(fold(row.get("name", "")) == fold(artist)
                                                     for row in rival_credits))
-            if not (exact_title and (not competing_same_title or exact_artist and not rival_exact_artist)):
+            # A solo credit for the named artist beats a same-title version that adds
+            # collaborators: "Halo by Beyonce" vs the 2CELLOS cover crediting Beyonce as writer.
+            solo = lambda rows: bool(artist) and {fold(row.get("name", "")) for row in rows} == {fold(artist)}
+            solo_wins = exact_artist and rival_exact_artist and solo(credits) and not solo(rival_credits)
+            if not (exact_title and (not competing_same_title or exact_artist and not rival_exact_artist or solo_wins)):
                 self._note_resolution(via + ":ambiguous", *_title_diag(requested, ranked))
                 raise AmbiguousMatch(query, ranked[:3])
         self._note_resolution(via, *_title_diag(title if artist else query, ranked))
@@ -1612,6 +1675,10 @@ class Spotify:
             if not rank_albums(rows, title, artist):
                 rows = rows + lookup(title.strip())
         ranked = rank_albums(rows, title, artist)
+        exact = [(score, candidate) for score, candidate in ranked
+                 if album_key(candidate.name) == album_key(title)]
+        if exact:
+            ranked = exact
         if not ranked:
             self._note_resolution("album_search:not_found")
             raise LookupError("No confident album match for " + repr(query))
@@ -1642,12 +1709,29 @@ class Spotify:
         self.last_playback = {"method": "web_api_album_verified", "radio": 0}
         return candidate.label
 
-    def _now_playing(self, candidate: Candidate, timeout: float) -> bool:
+    def _now_playing(self, candidate: Candidate, timeout: float, *,
+                     initial_unavailable: bool = False) -> Optional[bool]:
         """Confirm through Windows' media info, not by polling the Web API."""
         from . import local_media
-        return local_media._wait_for(
-            lambda: _matches_local_candidate(candidate, local_media.snapshot()),
-            timeout=timeout)
+
+        class InitialMediaUnavailable(Exception):
+            pass
+
+        first = True
+
+        def matches():
+            nonlocal first
+            snapshot = local_media.snapshot()
+            if first:
+                first = False
+                if initial_unavailable and snapshot is None:
+                    raise InitialMediaUnavailable
+            return _matches_local_candidate(candidate, snapshot)
+
+        try:
+            return local_media._wait_for(matches, timeout=timeout)
+        except InitialMediaUnavailable:
+            return None
 
     def _play_uri_locally(self, candidate: Candidate) -> bool:
         """Open the track in the desktop app, which starts playing it.
@@ -1689,7 +1773,7 @@ class Spotify:
         return False
 
     def play_candidate(self, candidate: Candidate, then: Optional[list] = None) -> str:
-        """Start one track: Web API first (no window, fastest), else the app link.
+        """Start a local track via its URI, or use the Web API for other targets.
 
         ``then`` is a radio: track URIs sent in the same start_playback call, so
         the song plays first and the radio follows. Verification still checks
@@ -1706,14 +1790,46 @@ class Spotify:
         self.last_playback = None
         # Why the Web API did not carry this playback, for telemetry.
         skipped = ""
+        local_target = None
+        with self.command_target():
+            target = self.device()
+            try:
+                devices = self.sp.devices().get("devices", [])
+                if (self._is_local_target(target, devices) and
+                        not any(isinstance(device, dict) and device.get("is_active") is True
+                                and device.get("id") != target for device in devices)):
+                    local_target = target
+            except Exception:
+                devices = []
+            if local_target:
+                if not isinstance(candidate.uri, str) or not re.fullmatch(r"spotify:track:[A-Za-z0-9]+", candidate.uri):
+                    raise ValueError("Valid Spotify track URI required")
+                self._start_idle_uri(candidate.uri, lambda state: state.get("is_playing") is True and (
+                    (state.get("item") or {}).get("uri") == candidate.uri
+                    or ((state.get("item") or {}).get("linked_from") or {}).get("uri") == candidate.uri
+                ), "requested track")
+                self.last_playback = {"method": "uri_handler", "radio": 0,
+                                      "radio_skipped": len(follow),
+                                      "ms": int((time.perf_counter() - started) * 1000)}
+                return candidate.label
         if self._local_enabled():
             api_error = None
             accepted = False
+            dispatch_attempted = False
+            mutation = None
+            accepted_at = None
+            fallback_allowed = False
             try:
                 with self.command_target():
-                    self._call(self.sp.start_playback, uris=uris)
+                    fallback_allowed = bool(local_target and self.device() == local_target)
+                    mutation = self.sp.start_playback
+                    dispatch_attempted = True
+                    self._call(mutation, uris=uris)
                     accepted = True
-                    if self._now_playing(candidate, timeout=4.0):
+                    accepted_at = time.monotonic()
+                    native = self._now_playing(candidate, timeout=4.0,
+                                               initial_unavailable=True)
+                    if native is True:
                         self.radio_played = bool(follow)
                         self.last_playback = {"method": "web_api", "radio": len(follow),
                                               "ms": int((time.perf_counter() - started) * 1000)}
@@ -1725,10 +1841,14 @@ class Spotify:
                     log.info("Native confirmation missed accepted playback; checking track URI on device %r",
                              self.device_name)
                     try:
+                        remaining_horizon = None
+                        if native is None:
+                            remaining_horizon = max(
+                                0.0, 4.75 - (time.monotonic() - accepted_at))
                         self._verify(lambda s: s.get("is_playing") is True and (
                             (s.get("item") or {}).get("uri") == candidate.uri
                             or ((s.get("item") or {}).get("linked_from") or {}).get("uri") == candidate.uri
-                        ), "requested track")
+                        ), "requested track", horizon=remaining_horizon)
                     except Exception:
                         log.warning("Could not verify accepted playback on device %r for track %s",
                                     self.device_name, candidate.uri)
@@ -1738,25 +1858,32 @@ class Spotify:
                                           "native_confirmation": "missed",
                                           "ms": int((time.perf_counter() - started) * 1000)}
                     return candidate.label
-            except SpotifyRequestDeferred as exc:
-                if accepted:
-                    raise
+            except Exception as exc:
+                # These local guard errors precede dispatch. A real HTTP 429
+                # is raised *from* its response error by _RateLimitGuard, and
+                # therefore is never mistaken for an unsent cooldown/budget stop.
+                local_rejection = (isinstance(exc, (SpotifyRequestDeferred, SpotifyRateLimited))
+                                   and exc.__cause__ is None
+                                   and not isinstance(exc, PlaybackVerificationError))
+                dispatch_state = getattr(mutation, "_dispatch_state", None)
+                if isinstance(dispatch_state, dict):
+                    local_rejection = dispatch_state.get("sent") is False
+                if accepted or (dispatch_attempted and not local_rejection):
+                    uncertainty = _playback_uncertainty(exc)
+                    if uncertainty is exc:
+                        raise
+                    raise uncertainty from exc
                 api_error = exc
-                skipped = "local_request_deferred"
-            except SpotifyRateLimited as exc:
-                if accepted:
+                skipped = ("local_request_deferred" if isinstance(exc, SpotifyRequestDeferred) else
+                           "rate_limited" if isinstance(exc, SpotifyRateLimited) else type(exc).__name__)
+                if not fallback_allowed:
                     raise
-                api_error = exc
-                skipped = "rate_limited"
-            except (spotipy.SpotifyException, PlaybackVerificationError, RuntimeError, OSError) as exc:
-                if accepted:
-                    raise
-                api_error = exc
-                skipped = type(exc).__name__
-                log.info("Web API playback unavailable (%s); opening the track in the app", exc)
+                log.info("Web API playback stopped before dispatch (%s); trying the desktop", type(exc).__name__)
             try:
                 desktop_started = self._play_uri_locally(candidate)
             except Exception as exc:
+                if isinstance(exc, PlaybackVerificationError):
+                    raise
                 if api_error is None:
                     raise
                 log.info("Desktop playback fallback failed (%s)", exc)
@@ -1778,11 +1905,17 @@ class Spotify:
             # verification path above; it must never reach another mutation.
             raise PlaybackVerificationError("Could not verify requested track after accepted playback")
         with self.command_target():
-            self._call(self.sp.start_playback, uris=uris)
-            self._verify(lambda s: s.get("is_playing") is True and (
-                (s.get("item") or {}).get("uri") == candidate.uri
-                or ((s.get("item") or {}).get("linked_from") or {}).get("uri") == candidate.uri
-            ), "requested track")
+            try:
+                self._call(self.sp.start_playback, uris=uris)
+                self._verify(lambda s: s.get("is_playing") is True and (
+                    (s.get("item") or {}).get("uri") == candidate.uri
+                    or ((s.get("item") or {}).get("linked_from") or {}).get("uri") == candidate.uri
+                ), "requested track")
+            except Exception as exc:
+                uncertainty = _playback_uncertainty(exc)
+                if uncertainty is exc:
+                    raise
+                raise uncertainty from exc
         self.radio_played = bool(follow)
         self.last_playback = {"method": "web_api_verified", "radio": len(follow),
                               "web_api_skipped": skipped,

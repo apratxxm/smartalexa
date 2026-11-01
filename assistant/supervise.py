@@ -7,8 +7,10 @@ how the assistant stayed dead after a reboot. This loop is the task action.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -23,6 +25,10 @@ OLLAMA_HEALTH = "http://127.0.0.1:11434/api/version"
 OLLAMA_READY_SECONDS = 3.0
 DEPENDENCY_CHECK_SECONDS = 30.0
 _ollama_process: subprocess.Popen | None = None
+REVIEW_HEALTH = "http://127.0.0.1:8767/health"
+REVIEW_READY_SECONDS = 3.0
+REVIEW_SERVICE_ID = {"service": "smartalexa-wake-review", "version": 1}
+_review_process: subprocess.Popen | None = None
 
 
 def _ollama_ready() -> bool:
@@ -34,6 +40,68 @@ def _ollama_ready() -> bool:
             return response.status == 200
     except (OSError, TimeoutError):
         return False
+
+
+def _review_health() -> bool:
+    """Return true only for the assistant's expected local review service."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(REVIEW_HEALTH, timeout=0.25) as response:
+            if response.status != 200:
+                return False
+            raw = response.read(1025)
+        if len(raw) > 1024:
+            return False
+        return json.loads(raw) == REVIEW_SERVICE_ID
+    except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _review_port_open() -> bool:
+    """Check whether 8767 is occupied even if its listener is not HTTP."""
+    try:
+        with socket.create_connection(("127.0.0.1", 8767), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_review_server() -> None:
+    """Keep the fixed-port wake review page available without adopting peers."""
+    global _review_process
+    if _review_health():
+        return
+    if _review_process is not None:
+        if _review_process.poll() is None:
+            return
+        _review_process = None
+    if _review_port_open():
+        log.warning("Port 8767 is occupied by an unexpected service; wake review not started")
+        return
+    try:
+        _review_process = subprocess.Popen(
+            [sys.executable, "-m", "assistant.experimental.wake_train.review_server",
+             "--port", "8767", "--strict-port"],
+            cwd=str(ROOT), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        log.warning("Could not start wake review server on port 8767: %s", exc)
+        return
+    deadline = time.monotonic() + REVIEW_READY_SECONDS
+    while time.monotonic() < deadline:
+        if _review_health():
+            log.info("Wake review server is ready on port 8767")
+            return
+        if _review_process.poll() is not None:
+            break
+        time.sleep(0.25)
+    if _review_process.poll() is not None:
+        _review_process = None
+        log.warning("Wake review server exited during startup")
+    else:
+        log.warning("Wake review server is still starting; assistant will continue")
 
 
 def _ollama_executable(configured_path: str | None = None) -> str | None:
@@ -108,6 +176,13 @@ def ensure_local_ollama() -> None:
     log.warning("Local Ollama is still starting; assistant will start listening")
 
 
+def resolve_runtime_module(config) -> str:
+    runtime = config.get("runtime.runtime", "legacy")
+    if runtime not in {"legacy", "core"}:
+        raise ValueError("runtime.runtime must be legacy or core")
+    return "assistant.core" if runtime == "core" else "assistant.main"
+
+
 def main() -> None:
     logging.basicConfig(
         filename=str(ROOT / "assistant" / "logs" / "supervise.log"),
@@ -115,15 +190,22 @@ def main() -> None:
     install_process_lifetime()
     backoff = 5.0
     while True:
-        ensure_local_ollama()
+        config = load()
+        module = resolve_runtime_module(config)
+        runtime = "core" if module == "assistant.core" else "legacy"
+        if runtime == "legacy":
+            ensure_review_server()
+            ensure_local_ollama()
         started = time.monotonic()
-        child = subprocess.Popen([sys.executable, "-m", "assistant.main"], cwd=str(ROOT))
+        child = subprocess.Popen([sys.executable, "-m", module], cwd=str(ROOT))
         while True:
             try:
                 code = child.wait(timeout=DEPENDENCY_CHECK_SECONDS)
                 break
             except subprocess.TimeoutExpired:
-                ensure_local_ollama()
+                if runtime == "legacy":
+                    ensure_review_server()
+                    ensure_local_ollama()
         ran = time.monotonic() - started
         if code == 0:
             log.info("Assistant exited normally after %.0f s; not restarting", ran)

@@ -1,0 +1,16 @@
+timeout_seconds: 25
+thresholds: # provisional (lead 28 Oct)
+  jam: 3
+  questions: 3
+  negatives: 3
+lines:
+  - {id: J1, mode: normal, category: jam, capability: start_jam, phrase: 'Alexa, start a jam', note: 'Verify the Jam invitation and QR on screen.'}
+  - {id: J2, mode: normal, category: jam, capability: start_jam, phrase: 'Alexa, show the jam code', note: 'Verify the Jam invitation and QR on screen.'}
+  - {id: J3, mode: normal, category: jam, capability: start_jam, phrase: 'Alexa, show the jam qr', note: 'Verify the Jam invitation and QR on screen.'}
+  - {id: Q1, mode: normal, category: questions, phrase: 'Alexa, what is the capital of France?', note: 'Check the answer and Wikipedia source in the turn row.'}
+  - {id: Q2, mode: normal, category: questions, phrase: 'Alexa, who was Ada Lovelace?', note: 'Check the answer and Wikipedia source in the turn row.'}
+  - {id: Q3, mode: normal, category: questions, phrase: 'Alexa, what is photosynthesis?', note: 'Check the answer and Wikipedia source in the turn row.'}
+  - {id: Q4, mode: normal, category: questions, phrase: 'Alexa, where is Mount Everest?', note: 'Check the answer and Wikipedia source in the turn row.'}
+  - {id: N1, mode: normal, category: negatives, kind: privacy, phrase: 'Alexa, what is my password?', note: 'No retrieval: the turn row must have no knowledge_source.'}
+  - {id: N2, mode: normal, category: negatives, kind: privacy, phrase: 'Alexa, what is my address?', note: 'No retrieval: the turn row must have no knowledge_source.'}
+  - {id: N3, mode: normal, category: negatives, kind: privacy, phrase: 'Alexa, what is my account PIN?', note: 'No retrieval: the turn row must have no knowledge_source.'}

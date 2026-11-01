@@ -116,6 +116,88 @@ def _diagnostic_bundle(value):
         return None, "invalid"
 
 
+_REPORT_BREAK_REASONS = frozenset((
+    "read_id_gap", "flush", "callback_overflow", "callback_status",
+    "intentional_discard", "echo_generation", "inactive_or_invalid_clean",
+    "nonmonotonic_source_time", "flush_after_tail", "pair_append_failure",
+))
+
+
+def _report_coverage(value, raw_size: int):
+    """Validate and copy only the paired-report coverage v1 contract."""
+    required = {
+        "version", "sample_rate", "clock", "window_start", "window_end",
+        "diagnostic_generation", "read_start", "read_end_exclusive",
+        "retained_samples", "pairing", "sample_alignment",
+        "capture_continuity", "padding_possible", "status", "break_reasons",
+    }
+    optional = {"estimated_source_start", "estimated_source_end",
+                "read_completed_start", "read_completed_end"}
+    if not isinstance(value, Mapping) or required - set(value) or set(value) - required - optional:
+        return None, "invalid_coverage"
+
+    def integer(name):
+        item = value[name]
+        return isinstance(item, Integral) and not isinstance(item, bool) and item >= 0
+
+    def finite(item):
+        return (item is None or (isinstance(item, Real) and not isinstance(item, bool)
+                                 and np.isfinite(float(item))))
+
+    try:
+        valid = (integer("version") and value["version"] == 1
+                 and integer("sample_rate") and value["sample_rate"] == 16000
+                 and value["clock"] == "perf_counter"
+                 and finite(value["window_start"]) and value["window_start"] is not None
+                 and finite(value["window_end"]) and value["window_end"] is not None
+                 and value["window_start"] <= value["window_end"]
+                 and integer("diagnostic_generation")
+                 and integer("retained_samples") and value["retained_samples"] == raw_size
+                 and value["pairing"] == "read_invocation"
+                 and value["sample_alignment"] == "unverified"
+                 and value["capture_continuity"] == "unverified"
+                 and value["padding_possible"] is True
+                 and value["status"] in {"available", "partial", "missing", "failed"})
+        if not valid:
+            return None, "invalid_coverage"
+        if any(not finite(value[name]) for name in optional if name in value):
+            return None, "invalid_coverage"
+        for name in ("read_start", "read_end_exclusive"):
+            item = value[name]
+            if item is not None and not integer(name):
+                return None, "invalid_coverage"
+        if ((value["read_start"] is None) != (value["read_end_exclusive"] is None)
+                or (value["read_start"] is not None
+                    and value["read_end_exclusive"] <= value["read_start"])):
+            return None, "invalid_coverage"
+        if raw_size and value["read_start"] is None:
+            return None, "invalid_coverage"
+        for first, last in (("estimated_source_start", "estimated_source_end"),
+                            ("read_completed_start", "read_completed_end")):
+            if (first in value) != (last in value):
+                return None, "invalid_coverage"
+            if (first in value and ((value[first] is None) != (value[last] is None)
+                    or (value[first] is not None and value[last] < value[first]))):
+                return None, "invalid_coverage"
+        reasons = value["break_reasons"]
+        if (not isinstance(reasons, list) or len(reasons) > 12
+                or any(not isinstance(code, str) or code not in _REPORT_BREAK_REASONS
+                       for code in reasons)):
+            return None, "invalid_coverage"
+        clean = dict(value)
+        clean["break_reasons"] = list(reasons)
+        for name in ("version", "sample_rate", "diagnostic_generation",
+                     "read_start", "read_end_exclusive", "retained_samples"):
+            if clean[name] is not None:
+                clean[name] = int(clean[name])
+        for name in optional | {"window_start", "window_end"}:
+            if clean.get(name) is not None:
+                clean[name] = float(clean[name])
+        return clean, "structurally_validated"
+    except (TypeError, ValueError, OverflowError):
+        return None, "invalid_coverage"
+
+
 @dataclass
 class Event:
     """One trigger, from wake word through to Spotify outcome."""
@@ -155,6 +237,7 @@ class Event:
     audio_n_frames: Optional[int] = None
     audio_status: str = "not_attempted"
     audio_reason: str = ""
+    jsonl_status: str = "pending"
     audio_sha256: str = ""
     processed_audio_status: str = "unavailable"
     processed_audio_reason: str = ""
@@ -325,6 +408,8 @@ def format_summary(event: Event) -> str:
         if event.second_stt_transcript:
             parts.append("turbo={!r}".format(event.second_stt_transcript))
         parts.append("woke_early={}".format(event.woke_early))
+        parts.append("audio_status={} audio_reason={} index={}".format(
+            event.audio_status, event.audio_reason or "-", event.jsonl_status))
         if event.wake_scores:
             parts.append("oww=" + ",".join("{}:{:.2f}".format(m, s)
                                            for m, s in sorted(event.wake_scores.items())))
@@ -387,6 +472,21 @@ class Telemetry:
         self.sample_rate = cfg.get("audio.sample_rate", 16000)
         self.capture_session_id = uuid.uuid4().hex
         self._archive_lock = threading.RLock()
+        self._archive_protected_paths: set[Path] = set()
+        self._stats_lock = threading.Lock()
+        self._diagnostic_outcomes = {
+            "jsonl_write_success": 0,
+            "jsonl_write_failure": 0,
+            "near_miss_audio_saved": 0,
+            "near_miss_audio_rate_limited": 0,
+            "near_miss_audio_cap_suppressed": 0,
+            "near_miss_audio_other_suppressed": 0,
+            "near_miss_audio_unavailable": 0,
+            "near_miss_audio_failed": 0,
+            "near_miss_audio_disabled": 0,
+            "near_miss_audio_other": 0,
+            "near_miss_saved_unindexed": 0,
+        }
         self.candidate_max_frames = max(1, int(6.0 * self.sample_rate))
 
         # Telemetry is strictly best effort: a full or read-only disk must not
@@ -561,7 +661,8 @@ class Telemetry:
             pinned.add(canonical)
         return pinned, True
 
-    def _prune_audio(self, required_bytes: int = 0, subdir: str = "") -> bool:
+    def _prune_audio(self, required_bytes: int = 0, subdir: str = "",
+                     protected_paths=None) -> bool:
         """Rolling, size-capped archive. Oldest out first.
 
         Sub-directory clips (near misses) count toward the same cap and also
@@ -570,10 +671,14 @@ class Telemetry:
         if required_bytes > cap:
             return False
         pinned, review_store_valid = self._reviewed_wav_paths()
+        protected = set(self._archive_protected_paths)
+        if protected_paths:
+            protected.update(Path(path).resolve(strict=False) for path in protected_paths)
 
         def is_pinned(entry) -> bool:
             try:
-                return entry[2].resolve(strict=False) in pinned
+                path = entry[2].resolve(strict=False)
+                return path in pinned or path in protected
             except (OSError, RuntimeError):
                 # An ambiguous candidate path is protected from deletion.
                 return True
@@ -623,20 +728,149 @@ class Telemetry:
                          capture_session_id=self.capture_session_id,
                          pruned_audio_path=relative, audio_status="pruned", audio_reason=reason))
 
-    def write(self, event: Event) -> None:
+    def diagnostic_outcome_snapshot(self) -> dict[str, int]:
+        """Return fixed-category diagnostic outcome totals without event identifiers."""
+        with self._stats_lock:
+            return dict(self._diagnostic_outcomes)
+
+    def _count_diagnostic_outcome(self, key: str) -> None:
+        with self._stats_lock:
+            self._diagnostic_outcomes[key] += 1
+
+    def record_report_diagnostic(self, parent: Event, raw: np.ndarray,
+                                 processed: Optional[np.ndarray], *,
+                                 coverage: Mapping, parent_indexed: bool) -> Event:
+        """Archive one paired diagnostic child without changing its report parent."""
+        event = Event(
+            trigger_source="miss_diagnostic", outcome="unknown", request_phase="diagnostic",
+            capture_session_id=self.capture_session_id, overlap_of=getattr(parent, "event_id", ""),
+            review_state="unknown", diagnostic_only=True,
+        )
+        raw_size = int(raw.size) if isinstance(raw, np.ndarray) else 0
+        cleaned, coverage_status = _report_coverage(coverage, raw_size)
+        valid_pair = (isinstance(raw, np.ndarray) and raw.ndim == 1 and raw.size > 0
+                      and raw.dtype == np.dtype(np.int16)
+                      and isinstance(processed, np.ndarray) and processed.ndim == 1
+                      and processed.dtype == np.dtype(np.int16)
+                      and processed.shape == raw.shape)
+        archive_status = "invalid_coverage" if cleaned is None else "invalid_pair" if not valid_pair else "suppressed"
+        event.audio_status = "unavailable" if cleaned is None or not valid_pair else "suppressed"
+        event.audio_reason = coverage_status if cleaned is None else "invalid_pcm_pair" if not valid_pair else ""
+        if valid_pair and raw.size > 480000:
+            event.audio_status, event.audio_reason = "unavailable", "pair_too_large"
+            archive_status = "oversize_pair"
+
+        parent_path = None
+        if valid_pair and cleaned is not None and raw.size <= 480000:
+            try:
+                root = self.jsonl_path.parent.parent.parent.resolve(strict=False)
+                audio_root = self.audio_dir.resolve(strict=False)
+                raw_parent_path = Path(parent.audio_path)
+                candidate = raw_parent_path if raw_parent_path.is_absolute() else root / raw_parent_path
+                resolved = candidate.resolve(strict=True)
+                if (parent.audio_status == "saved" and candidate.is_file()
+                        and os.path.normcase(os.path.abspath(str(candidate))) == os.path.normcase(str(resolved))
+                        and resolved.suffix.lower() == ".wav"
+                        and _GENERATED_WAV.match(resolved.name)):
+                    resolved.relative_to(audio_root)
+                    parent_path = resolved
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                parent_path = None
+
+        if valid_pair and cleaned is not None and raw.size <= 480000:
+            if parent_path is None:
+                event.audio_status, event.audio_reason = "unavailable", "parent_archive_untrusted"
+                archive_status = "parent_archive_unavailable"
+            elif not isinstance(parent_indexed, bool) or not parent_indexed:
+                event.audio_status, event.audio_reason = "unavailable", "parent_not_indexed"
+                archive_status = "parent_not_indexed"
+            elif not self.archive_audio:
+                event.audio_status, event.audio_reason = "disabled", "archive_disabled"
+                archive_status = "disabled"
+            else:
+                raw_event = Event(ts=event.ts, event_id=event.event_id, capture_session_id=event.capture_session_id)
+                clean_event = Event(ts=event.ts, event_id=event.event_id + "-processed",
+                                    capture_session_id=event.capture_session_id)
+                raw_bytes = int(raw.nbytes) + 44
+                clean_bytes = int(processed.nbytes) + 44
+                with self._archive_lock:
+                    previous_protected = set(self._archive_protected_paths)
+                    self._archive_protected_paths.add(parent_path)
+                    try:
+                        if not self._prune_audio(raw_bytes + clean_bytes):
+                            event.audio_status, event.audio_reason = "suppressed", "archive_cap"
+                            archive_status = "archive_cap"
+                        else:
+                            event.audio_path = self.save_audio(raw_event, raw)
+                            event.audio_status = raw_event.audio_status
+                            event.audio_reason = raw_event.audio_reason
+                            event.audio_sha256 = raw_event.audio_sha256
+                            event.audio_n_frames = raw_event.audio_n_frames
+                            if event.audio_path:
+                                raw_path = (root / event.audio_path).resolve(strict=False)
+                                self._archive_protected_paths.add(raw_path)
+                                event.processed_audio_path = self.save_audio(clean_event, processed)
+                                event.processed_audio_status = clean_event.audio_status
+                                event.processed_audio_reason = clean_event.audio_reason
+                                event.processed_audio_sha256 = clean_event.audio_sha256
+                                event.processed_alignment = "unverified"
+                                archive_status = ("saved" if event.processed_audio_path else "raw_saved_clean_failed")
+                            else:
+                                event.processed_audio_status = "unavailable"
+                                event.processed_audio_reason = "raw_archive_unavailable"
+                                archive_status = "raw_" + event.audio_status
+                    except Exception:
+                        if event.audio_status != "saved":
+                            event.audio_status = "failed"
+                            event.audio_reason = "archive_transaction_error"
+                        if event.processed_audio_status == "unavailable":
+                            event.processed_audio_status = clean_event.audio_status
+                            event.processed_audio_reason = clean_event.audio_reason
+                        archive_status = "archive_transaction_error"
+                        log.warning("paired report diagnostic archive failed", exc_info=True)
+                    finally:
+                        self._archive_protected_paths.clear()
+                        self._archive_protected_paths.update(previous_protected)
+
+        saved_samples = (int(event.audio_n_frames or 0) if event.audio_status == "saved" else 0)
+        diagnostic = {
+            "coverage": cleaned,
+            "archive_status": archive_status,
+            "saved_samples": saved_samples,
+            "crop_start_sample": 0,
+            "crop_end_sample_exclusive": saved_samples,
+        }
+        event.diagnostic_metadata = diagnostic
+        event.diagnostic_metadata_status = coverage_status
+        self.write(event)
+        return event
+
+    def write(self, event: Event) -> bool:
+        """Append one JSONL record and return whether its index was written."""
         if not event.capture_session_id:
             event.capture_session_id = self.capture_session_id
+        # The append outcome cannot be truthfully included in the record being
+        # appended. Keep it on the returned event and human summary instead.
+        event.jsonl_status = "unconfirmed"
         record: dict[str, Any] = asdict(event)
+        record.pop("jsonl_status", None)
+        indexed = True
         try:
             self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.jsonl_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as exc:
+            indexed = False
+            event.jsonl_status = "failed"
             log.warning("json telemetry unavailable: %s", exc)
+        else:
+            event.jsonl_status = "indexed"
+        self._count_diagnostic_outcome("jsonl_write_success" if indexed else "jsonl_write_failure")
         try:
             log.info("%s", format_summary(event))
         except Exception:  # a formatting slip must not cost the JSONL record
             log.debug("could not format command summary", exc_info=True)
+        return indexed
 
     def record_near_miss(self, pcm: np.ndarray, transcript: str, reason: str, *,
                          woke_early: bool = False, scores: Optional[dict] = None,
@@ -784,5 +1018,21 @@ class Telemetry:
                             event.processed_audio_reason = event.audio_reason or "raw_archive_unavailable"
         elif event.audio_status == "not_attempted":
             event.audio_status, event.audio_reason = "unavailable", "empty_or_invalid_audio"
-        self.write(event)
+        indexed = self.write(event)
+        outcome_key = {
+            "saved": "near_miss_audio_saved",
+            "unavailable": "near_miss_audio_unavailable",
+            "failed": "near_miss_audio_failed",
+            "disabled": "near_miss_audio_disabled",
+        }.get(event.audio_status)
+        if event.audio_status == "suppressed":
+            outcome_key = {
+                "rate_limited": "near_miss_audio_rate_limited",
+                "archive_cap": "near_miss_audio_cap_suppressed",
+            }.get(event.audio_reason, "near_miss_audio_other_suppressed")
+        self._count_diagnostic_outcome(outcome_key or "near_miss_audio_other")
+        if not indexed and event.audio_status == "saved":
+            # The WAV is intentionally retained; the returned event identifies
+            # its path while this aggregate records that it lacks a JSONL index.
+            self._count_diagnostic_outcome("near_miss_saved_unindexed")
         return event

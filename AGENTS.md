@@ -1,40 +1,31 @@
 # Validation delegation
 
-## User-directed Luna swarm capacity
+## User-directed GPT-6.1 Terra medium swarm capacity
 
-- By the user's request, use as many Luna agents as required to finish independent
-  work efficiently; do not impose an additional fixed agent-count cap in this file.
-- Group tasks by exclusive file ownership. Never parallelize edits to the same
-  file, duplicate a lane, or create agents solely to increase the headcount.
-- Respect the runtime's actual concurrency and agent-thread limits. This policy
-  cannot raise those limits. Reuse available Luna workers and queue distinct lanes
-  when the runtime refuses another agent; report the actual limit honestly.
+Follow global Delegation and ownership. The user's direction sets no extra fixed worker cap;
+actual runtime limits still apply. Assign distinct work only when independent and non-overlapping;
+reuse or queue workers at limits. Do not duplicate lanes or rename existing chats.
 
 ## Distinct and stable worker names
 
-- New worker names must distinguish sibling scopes with 3–4 plain words, for
-  example “Check reply delivery,” “Check question expiry,” and “Check choice layout.”
-- Reuse the same name and task identity through continuation, restart, and messages.
-  Do not rename existing user chats or generate replacement labels from status text.
-
+Follow the global naming and continuity rules; names and task identities remain stable through
+continuation, restart and messages.
 
 ## Prompt-dump tracking
 
-When the user gives a multi-part request dump, record its requirements and priority
-in docs/ASSISTANT_PLAN.md for assistant work. The root ASSISTANT_PLAN.md is a
-temporary shared historical ledger, excluded from the assistant repository;
-do not overwrite another product's active work there. Token Tracker's lead owns
-its separate project and migration. Start the user-facing response with concise bullets covering
-each requested point and its subpoints, then address them in the user's priority
-order. Keep the ledger's completed, verified, pending, and blocked work distinct;
-do not copy private transcripts or claim success from plans or mocked tests.
+Use docs/ASSISTANT_PLAN.md as the compact active checkpoint (target <=400 words).
+Read it once on resume or when context is missing/changed, not on every prompt,
+status request or worker return. Read cold history only for a specific unresolved
+detail. Update only material new requirements, decisions, blockers, accepted evidence
+or interruption checkpoints; replace current item state instead of appending narration.
+Keep source/mock/live evidence distinct and preserve unresolved work when compacting.
+No extra model calls merely to refresh tracking. The root ASSISTANT_PLAN.md is another
+product's historical ledger; Token Tracker remains separately owned. Briefly account
+for multi-part requests without repeating supplied context or resolved points.
 
-Apply C:/Users/aprat/.codex/AGENTS.md's validation ownership and evidence workflow:
-Luna executes focused tests, recorded-input replays, model probes and bounded log
-extraction. The lead defines acceptance and diagnoses results; Luna implements bounded fixes
-while the lead handles architecture and final review. Keep test/source ownership exclusive, wait for ready
-handoffs before integration runs, and distinguish mocked tests from live microphone,
-speaker, GPU inference, Spotify and Codex execution evidence.
+Follow global review gates, bounded reviewer packet/disposition, worker reuse/ownership and risk-based validation policy. Continue only within this project's authorized scope and checkpoint priority; keep proposed and approved work distinct. Preserve this project's proof limits:
+keep source/test ownership exclusive and distinguish mocked checks from live microphone, speaker,
+GPU inference, Spotify and Codex execution evidence.
 
 # Claude Design imports
 
@@ -71,5 +62,5 @@ When a user provides a `claude.ai/design/p/...` project link:
 ## Context lifecycle
 
 Follow `C:/Users/aprat/.codex/AGENTS.md`, section “Context lifecycle and Astra escalation,”
-for all root chats, subagents, and handoffs in this project. Native Luna compaction is not
-automatically available; use only supported host lifecycle behavior and reviewed handoffs.
+for all root chats, subagents, and handoffs in this project. Use only supported host
+compaction behavior and reviewed handoffs.
